@@ -6690,6 +6690,7 @@ def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str
     report_date = reference_date.isoformat()
     cutoff_date = reference_date.isoformat()
     cutoff_year = reference_date.year
+    chat_title = f"Resumen Escolar - {STUDENT_NAME} - {report_date}"
     evidence_blocks: list[str] = []
 
     for snapshot in snapshots:
@@ -6714,6 +6715,9 @@ def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str
         evidence_blocks.append("No habia pestanas de SchoolNet/Classroom disponibles al generar este prompt.")
 
     prompt = [
+        f"TITULO SUGERIDO DEL CHAT: {chat_title}",
+        "Usa este titulo para nombrar la conversacion si la interfaz de ChatGPT lo permite, de modo que el historial sea buscable por fecha. No agregues texto fuera de la imagen.",
+        "",
         f"Actua como asistente escolar y disenador de infografias educativas. El estudiante se llama {STUDENT_NAME}. Usa SOLO la evidencia copiada abajo.",
         "",
         "No inventes datos. Si falta informacion, escribe exactamente \"No detectado\". Usa PENDIENTES / DUDAS solo para listar informacion incompleta o contradicciones, pero no rellenes datos ausentes.",
