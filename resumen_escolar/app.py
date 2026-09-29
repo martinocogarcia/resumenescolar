@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import datetime as dt
 import hashlib
 import html
 import json
+import mimetypes
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -19,7 +22,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 
 APP_TITLE = "Resumen Escolar"
@@ -30,8 +35,22 @@ CLASSROOM_URL = "https://classroom.google.com/"
 CLASSROOM_4A_COURSE_ID = "ODQ5Nzk2MDk0NDk5"
 CLASSROOM_4A_COURSE_URL = f"https://classroom.google.com/c/{CLASSROOM_4A_COURSE_ID}"
 CLASSROOM_4A_CLASSWORK_URL = f"https://classroom.google.com/w/{CLASSROOM_4A_COURSE_ID}/t/all"
+SSCC_CALENDAR_URL = "https://ssccmanquehue.cl/calendario-segundo-ciclo"
+SSCC_CALENDAR_4A_ID = "c_aejfpaujkj4nm4u6kfbsc4eu2g@group.calendar.google.com"
+SSCC_CALENDAR_4A_ICS_URL = (
+    "https://calendar.google.com/calendar/ical/"
+    f"{quote(SSCC_CALENDAR_4A_ID, safe='')}/public/basic.ics"
+)
 CHROME_EXE = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 EDGE_EXE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+BROWSER_EXE_ENV = "RESUMEN_ESCOLAR_BROWSER_EXE"
+PROFILE_DIR_ENV = "RESUMEN_ESCOLAR_PROFILE_DIR"
+CDP_URL_ENV = "RESUMEN_ESCOLAR_CDP_URL"
+HEADLESS_ENV = "RESUMEN_ESCOLAR_HEADLESS"
+SCHOOLNET_USERNAME_ENV = "RESUMEN_ESCOLAR_SCHOOLNET_USERNAME"
+SCHOOLNET_PASSWORD_ENV = "RESUMEN_ESCOLAR_SCHOOLNET_PASSWORD"
+REPORT_TIMEZONE_ENV = "RESUMEN_ESCOLAR_TIMEZONE"
+DEFAULT_REPORT_TIMEZONE = "America/Santiago"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_DIR = PROJECT_ROOT / ".runtime"
 LOCAL_SITE_PACKAGES = RUNTIME_DIR / "site-packages"
@@ -534,6 +553,217 @@ CLASSROOM_CLICK_POST_CANDIDATE_SCRIPT = """
   el.scrollIntoView({ block: 'center', inline: 'center' });
   el.click();
   return { clicked: true };
+}
+"""
+SSCC_CALENDAR_4A_EXTRACT_SCRIPT = """
+() => {
+  const normalize = (value) => (value || '')
+    .toString()
+    .normalize('NFD')
+    .replace(/[\\u0300-\\u036f]/g, '')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+  const has4A = (value) => /(^|[^0-9a-z])4\\s*(?:-|°|º)?\\s*a([^0-9a-z]|$)/i.test(normalize(value));
+  const isVisible = (el) => {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  };
+  const cleanLine = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+  const compactBlock = (value) => {
+    const parts = [];
+    const seen = new Set();
+    for (const part of (value || '').split(/\\n+/).map(cleanLine).filter(Boolean)) {
+      const key = normalize(part);
+      if (!seen.has(key)) {
+        seen.add(key);
+        parts.push(part);
+      }
+    }
+    return parts.join(' | ').slice(0, 700);
+  };
+
+  const candidates = [];
+  const addCandidate = (source, text) => {
+    const compact = compactBlock(text);
+    if (!compact || !has4A(compact)) return;
+    candidates.push({ source, text: compact });
+  };
+
+  const bodyText = document.body ? document.body.innerText || document.body.textContent || '' : '';
+  const lines = bodyText.split(/\\n+/).map(cleanLine).filter(Boolean);
+  let dateContext = '';
+  for (let index = 0; index < lines.length; index += 1) {
+    const normalizedLine = normalize(lines[index]);
+    if (
+      normalizedLine.includes('eventos,') ||
+      normalizedLine.includes('evento,') ||
+      /^(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo),?\\s+\\d{1,2}\\b/.test(normalizedLine)
+    ) {
+      dateContext = lines[index];
+    }
+    if (!has4A(lines[index])) continue;
+    if (
+      (normalizedLine.startsWith('todo el dia') || normalizedLine.startsWith('todo el día')) &&
+      index > 0 &&
+      has4A(lines[index - 1])
+    ) {
+      continue;
+    }
+    const contextLines = [];
+    if (dateContext) contextLines.push(dateContext);
+    contextLines.push(lines[index]);
+    const next = lines[index + 1] || '';
+    if (has4A(next) || normalize(next).startsWith('todo el dia') || normalize(next).startsWith('todo el día')) {
+      contextLines.push(next);
+    }
+    addCandidate('linea de calendario', contextLines.join('\\n'));
+  }
+
+  if (!candidates.length) {
+    const elements = Array.from(document.querySelectorAll('body *')).filter(isVisible);
+    for (const el of elements) {
+      const text = textOf(el);
+      if (!text || text.length > 900 || !has4A(text)) continue;
+      const hasChildSame = Array.from(el.children || []).some((child) => {
+        const childText = textOf(child);
+        return childText && has4A(childText) && normalize(childText) === normalize(text);
+      });
+      if (hasChildSame) continue;
+
+      let context = text;
+      let parent = el.parentElement;
+      for (let depth = 0; parent && depth < 5; depth += 1, parent = parent.parentElement) {
+        const parentText = textOf(parent);
+        if (parentText && has4A(parentText) && parentText.length <= 900 && parentText.length > context.length) {
+          context = parentText;
+        }
+      }
+      addCandidate('elemento visible', context);
+    }
+  }
+
+  const deduped = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = normalize(candidate.text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(candidate);
+  }
+  return deduped.slice(0, 80);
+}
+"""
+SCHOOLNET_LOGIN_SCRIPT = """
+(credentials) => {
+  const normalize = (value) => (value || '')
+    .toString()
+    .normalize('NFD')
+    .replace(/[\\u0300-\\u036f]/g, '')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  };
+  const labelText = (el) => {
+    const parts = [
+      el.getAttribute('aria-label'),
+      el.getAttribute('title'),
+      el.getAttribute('placeholder'),
+      el.getAttribute('name'),
+      el.id,
+    ].filter(Boolean);
+    if (el.id) {
+      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (label) parts.push(label.innerText || label.textContent || '');
+    }
+    const parentLabel = el.closest('label');
+    if (parentLabel) parts.push(parentLabel.innerText || parentLabel.textContent || '');
+    return normalize(parts.join(' '));
+  };
+  const setValue = (el, value) => {
+    const setter = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value')?.set;
+    if (setter) setter.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+  };
+  const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
+  const passwordInput = inputs.find((el) => (el.type || '').toLowerCase() === 'password');
+  const usernameInput =
+    inputs.find((el) => {
+      if (el === passwordInput) return false;
+      const type = (el.type || 'text').toLowerCase();
+      if (!['text', 'email', 'tel', 'search', ''].includes(type)) return false;
+      const label = labelText(el);
+      return ['usuario', 'user', 'rut', 'correo', 'email', 'login'].some((term) => label.includes(term));
+    }) ||
+    inputs.find((el) => el !== passwordInput && ['text', 'email', ''].includes((el.type || 'text').toLowerCase()));
+
+  if (!usernameInput || !passwordInput) {
+    return { filled_user: false, filled_password: false, checked_remember: false, clicked_submit: false };
+  }
+
+  usernameInput.focus();
+  setValue(usernameInput, credentials.username);
+  passwordInput.focus();
+  setValue(passwordInput, credentials.password);
+
+  let checkedRemember = false;
+  for (const checkbox of inputs.filter((el) => (el.type || '').toLowerCase() === 'checkbox')) {
+    const label = labelText(checkbox);
+    if (label.includes('record') || label.includes('mantener') || label.includes('remember')) {
+      if (!checkbox.checked) checkbox.click();
+      checkedRemember = true;
+      break;
+    }
+  }
+
+  const submitCandidates = Array.from(
+    document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]')
+  ).filter(isVisible);
+  const submit =
+    submitCandidates.find((el) => {
+      const text = normalize([
+        el.innerText,
+        el.textContent,
+        el.value,
+        el.getAttribute('aria-label'),
+        el.getAttribute('title'),
+      ].filter(Boolean).join(' '));
+      return ['ingresar', 'entrar', 'iniciar', 'acceder', 'login', 'sign in'].some((term) => text.includes(term));
+    }) ||
+    submitCandidates[0];
+  let submitted = false;
+  if (submit) {
+    submit.click();
+    submitted = true;
+  }
+  // Some SchoolNet builds attach the handler to the form submit event and
+  // ignore a synthetic button click. Give the page's native form handler a
+  // second, deterministic path without exposing the credentials.
+  if (!submitted) {
+    const form = passwordInput.closest('form') || usernameInput.closest('form');
+    if (form) {
+      if (typeof form.requestSubmit === 'function') form.requestSubmit();
+      else form.submit();
+      submitted = true;
+    }
+  }
+
+  return {
+    filled_user: true,
+    filled_password: true,
+    checked_remember: checkedRemember,
+    clicked_submit: submitted,
+  };
 }
 """
 CLASSROOM_OPEN_POST_BY_TITLE_SCRIPT = """
@@ -1649,14 +1879,16 @@ SCHOOLNET_GRADES_TABLE_SCRIPT = """
     const subjectIndex = Math.max(0, headers.findIndex((cell) => cell.includes('asignatura')));
     const p1Index = headers.findIndex((cell) => cell === 'p1');
     if (p1Index < 0) continue;
-    linesFromTables.push('LECTURA ESTRUCTURADA SCHOOLNET CALIFICACIONES P1');
+    const p2Index = headers.findIndex((cell) => cell === 'p2');
+    linesFromTables.push('LECTURA ESTRUCTURADA SCHOOLNET CALIFICACIONES P1/P2');
     linesFromTables.push('Fuente: tabla HTML visible');
-    linesFromTables.push('Formato: Asignatura | P1');
+    linesFromTables.push('Formato: Asignatura | P1 | P2');
     for (const cells of rows.slice(headerIndex + 1)) {
       const subject = (cells[subjectIndex] || '').trim();
       if (!subject) continue;
-      const value = cleanGrade(cells[p1Index] || '');
-      linesFromTables.push(`${subject} | ${value}`);
+      const p1 = cleanGrade(cells[p1Index] || '');
+      const p2 = p2Index >= 0 ? cleanGrade(cells[p2Index] || '') : '';
+      linesFromTables.push(`${subject} | ${p1} | ${p2}`);
     }
   }
   if (linesFromTables.length) return linesFromTables.join('\\n');
@@ -1689,9 +1921,11 @@ SCHOOLNET_GRADES_TABLE_SCRIPT = """
   });
 
   const p1Headers = nodes.filter((node) => node.norm === 'p1').sort((a, b) => a.top - b.top || a.left - b.left);
+  const p2Headers = nodes.filter((node) => node.norm === 'p2').sort((a, b) => a.top - b.top || a.left - b.left);
   const subjectHeader = nodes.find((node) => node.norm.includes('asignatura'));
   if (!p1Headers.length || !subjectHeader) return '';
   const p1Header = p1Headers[0];
+  const p2Header = p2Headers.find((node) => Math.abs(node.cy - p1Header.cy) <= 35 && node.left > p1Header.left) || null;
   const headerY = Math.min(subjectHeader.cy, p1Header.cy);
 
   const rows = [];
@@ -1718,9 +1952,9 @@ SCHOOLNET_GRADES_TABLE_SCRIPT = """
   rows.sort((a, b) => a.cy - b.cy);
   if (!rows.length) return '';
   const output = [
-    'LECTURA ESTRUCTURADA SCHOOLNET CALIFICACIONES P1',
+    'LECTURA ESTRUCTURADA SCHOOLNET CALIFICACIONES P1/P2',
     'Fuente: geometria visual de la tabla',
-    'Formato: Asignatura | P1',
+    'Formato: Asignatura | P1 | P2',
   ];
 
   for (let index = 0; index < rows.length; index += 1) {
@@ -1729,13 +1963,18 @@ SCHOOLNET_GRADES_TABLE_SCRIPT = """
     const nextY = index === rows.length - 1 ? row.cy + (row.cy - previousY || 56) : rows[index + 1].cy;
     const top = (previousY + row.cy) / 2;
     const bottom = (row.cy + nextY) / 2;
-    const grade = nodes
-      .filter((node) => gradeRe.test(node.text) && node.cy >= top && node.cy < bottom)
-      .map((node) => ({ node, distance: Math.abs(node.cx - p1Header.cx) }))
-      .filter((item) => item.distance < 45)
-      .sort((a, b) => a.distance - b.distance)[0];
-    const label = row.norm === 'promedios' ? 'Promedio P1' : row.text;
-    output.push(`${label} | ${grade ? cleanGrade(grade.node.text) : ''}`);
+    const gradeNear = (header) => {
+      if (!header) return null;
+      return nodes
+        .filter((node) => gradeRe.test(node.text) && node.cy >= top && node.cy < bottom)
+        .map((node) => ({ node, distance: Math.abs(node.cx - header.cx) }))
+        .filter((item) => item.distance < 45)
+        .sort((a, b) => a.distance - b.distance)[0] || null;
+    };
+    const p1 = gradeNear(p1Header);
+    const p2 = gradeNear(p2Header);
+    const label = row.norm === 'promedios' ? 'Promedio' : row.text;
+    output.push(`${label} | ${p1 ? cleanGrade(p1.node.text) : ''} | ${p2 ? cleanGrade(p2.node.text) : ''}`);
   }
 
   return output.join('\\n');
@@ -1916,6 +2155,57 @@ async () => {
   ];
   const gradeRe = /^(?:[1-7][,.][0-9])$/;
 
+  // SchoolNet keeps each evaluation in a child <tr> directly after its subject.
+  // Read that hierarchy before trying the visual-position fallback below.
+  const gradeTable = Array.from(document.querySelectorAll('table')).find((table) => {
+    const headers = Array.from(table.rows[0]?.cells || []).map((cell) => normalize(textOf(cell)));
+    return headers.includes('asignatura') && headers.includes('p1') && headers.includes('p2');
+  });
+  if (gradeTable) {
+    const output = [
+      'DETALLE POR ASIGNATURA SCHOOLNET CALIFICACIONES',
+      'Fuente: filas HTML de asignatura y evaluacion',
+    ];
+    let currentSubject = '';
+    let childGradeCount = 0;
+    let parentGrades = [];
+    let rowNumber = 0;
+    const partialGrades = (row) => Array.from(row.cells)
+      .filter((cell) => /^parcial\\d+_/.test(cell.id || ''))
+      .map((cell) => textOf(cell))
+      .filter((value) => gradeRe.test(value));
+    const flushParentWithoutChildren = () => {
+      if (currentSubject && !childGradeCount) {
+        for (let i = 0; i < parentGrades.length; i += 1) {
+          rowNumber += 1;
+          output.push(`Fila ${rowNumber} | Calificacion parcial ${i + 1} | ${parentGrades[i]}`);
+        }
+      }
+    };
+    for (const row of Array.from(gradeTable.rows).slice(1)) {
+      const name = textOf(row.cells[0] || row);
+      const subject = subjects.find((item) => normalize(name).replace(/[,:]/g, '') === item.norm);
+      if (subject) {
+        flushParentWithoutChildren();
+        currentSubject = name;
+        childGradeCount = 0;
+        parentGrades = partialGrades(row);
+        rowNumber = 0;
+        output.push('');
+        output.push(`ASIGNATURA: ${currentSubject}`);
+        continue;
+      }
+      if (!currentSubject || !row.cells[0]?.classList.contains('Tabla_CalCol_SubNotas')) continue;
+      const grades = partialGrades(row);
+      if (!grades.length) continue;
+      childGradeCount += grades.length;
+      rowNumber += 1;
+      output.push(`Fila ${rowNumber} | ${name} | ${grades.join(' | ')}`);
+    }
+    flushParentWithoutChildren();
+    return output.length > 2 ? output.join('\\n') : '';
+  }
+
   const collectNodes = () => {
     const raw = Array.from(document.querySelectorAll('body *')).filter(isVisible).map((el) => {
       const text = textOf(el);
@@ -1935,6 +2225,7 @@ async () => {
         left: rect.left,
         top: rect.top,
         bottom: rect.bottom,
+        expanded: el.getAttribute('aria-expanded'),
         cx: rect.left + rect.width / 2,
         cy: rect.top + rect.height / 2,
         width: rect.width,
@@ -1956,9 +2247,11 @@ async () => {
     .sort((a, b) => a.left - b.left || a.cy - b.cy)[0];
 
   const clickSubject = async (subjectNode, nodes) => {
+    const sameRow = (node) => Math.abs(node.cy - subjectNode.cy) <= 16;
+    if (nodes.some((node) => sameRow(node) && node.expanded === 'true')) return true;
     const controls = nodes.filter((node) => {
       if (node.el === subjectNode.el) return false;
-      const nearSameRow = Math.abs(node.cy - subjectNode.cy) <= 16;
+      const nearSameRow = sameRow(node);
       const leftOrInsideSubject = node.left <= subjectNode.left + 40;
       const looksExpandable = (
         node.labelNorm.includes('false') ||
@@ -2356,9 +2649,47 @@ CLASSROOM_TOPIC_EXCLUDED_LABELS = {
     "todos los temas",
     "all topics",
 }
-MAX_CLASSROOM_POSTS_TO_OPEN = 6
+
+
+def env_int(name: str, default: int, min_value: int = 0, max_value: int | None = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    if value < min_value:
+        return min_value
+    if max_value is not None and value > max_value:
+        return max_value
+    return value
+
+
+CLASSROOM_TOPIC_INCLUDE_ENV = "RESUMEN_ESCOLAR_CLASSROOM_TOPIC_INCLUDE"
+MAX_CLASSROOM_POSTS_TO_OPEN = env_int("RESUMEN_ESCOLAR_CLASSROOM_POSTS_TO_OPEN", 6, 1, 12)
 MAX_CLASSROOM_POST_AGE_DAYS = 31
-MAX_CLASSROOM_TOPIC_VIEWS = 12
+MAX_CLASSROOM_TOPIC_VIEWS = env_int("RESUMEN_ESCOLAR_CLASSROOM_TOPIC_VIEWS", 12, 1, 20)
+MAX_CLASSROOM_ATTACHMENTS_TO_OPEN = env_int("RESUMEN_ESCOLAR_CLASSROOM_ATTACHMENTS_TO_OPEN", 2, 0, 5)
+MAX_CLASSROOM_ATTACHMENT_POSTS_PER_SNAPSHOT = env_int(
+    "RESUMEN_ESCOLAR_CLASSROOM_ATTACHMENT_POSTS_PER_SNAPSHOT",
+    2,
+    0,
+    5,
+)
+MAX_CLASSROOM_ATTACHMENT_TEXT_CHARS = env_int("RESUMEN_ESCOLAR_CLASSROOM_ATTACHMENT_TEXT_CHARS", 7000, 1000, 20000)
+CLASSROOM_MATERIAL_WINDOW_DAYS = env_int("RESUMEN_ESCOLAR_CLASSROOM_MATERIAL_WINDOW_DAYS", 7, 1, 60)
+CLASSROOM_MATERIAL_MAX_RECORDS = env_int("RESUMEN_ESCOLAR_CLASSROOM_MATERIAL_MAX_RECORDS", 10, 0, 50)
+CLASSROOM_MATERIAL_MAX_PER_SUBJECT = env_int("RESUMEN_ESCOLAR_CLASSROOM_MATERIAL_MAX_PER_SUBJECT", 3, 1, 20)
+CLASSROOM_MATERIAL_MAX_FILE_BYTES = env_int(
+    "RESUMEN_ESCOLAR_CLASSROOM_MATERIAL_MAX_FILE_BYTES",
+    15 * 1024 * 1024,
+    0,
+    50 * 1024 * 1024,
+)
+CLASSROOM_MATERIAL_TEXT_CHARS = env_int("RESUMEN_ESCOLAR_CLASSROOM_MATERIAL_TEXT_CHARS", 3000, 500, 12000)
+MAX_SSCC_CALENDAR_EVENTS = 80
+SSCC_CALENDAR_LOOKAHEAD_MONTHS = 1
 
 
 def _enable_local_site_packages() -> None:
@@ -2376,12 +2707,48 @@ def configure_runtime_environment() -> None:
     os.environ["TMP"] = str(APP_TEMP_DIR)
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_terms(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [
+        normalize(part)
+        for part in re.split(r"[,;\n|]+", raw)
+        if normalize(part)
+    ]
+
+
 class AppError(RuntimeError):
     pass
 
 
+def report_timezone() -> ZoneInfo:
+    name = os.environ.get(REPORT_TIMEZONE_ENV, DEFAULT_REPORT_TIMEZONE).strip() or DEFAULT_REPORT_TIMEZONE
+    try:
+        return ZoneInfo(name)
+    except Exception as exc:
+        raise AppError(f"Zona horaria invalida en {REPORT_TIMEZONE_ENV}: {name}") from exc
+
+
+def current_report_datetime() -> dt.datetime:
+    return dt.datetime.now(report_timezone())
+
+
 def current_report_date() -> dt.date:
-    return dt.date.today()
+    return current_report_datetime().date()
+
+
+def add_calendar_months(value: dt.date, months: int) -> dt.date:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return dt.date(year, month, day)
 
 
 def is_browser_closed_error(exc: Exception) -> bool:
@@ -2475,21 +2842,21 @@ class EvidenceStore:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._prune_unusable_classroom_records()
+        self._prune_invalid_classroom_records()
         self.data["updated_at"] = now_iso()
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
-    def _prune_unusable_classroom_records(self) -> int:
+    def _prune_invalid_classroom_records(self) -> int:
         posts = self.entity("classroom_posts")
         removed = 0
         for record_id, record in list(posts.items()):
-            if not isinstance(record, dict) or not classroom_cache_record_is_usable(record):
+            if not isinstance(record, dict) or not classroom_cache_record_is_historical(record):
                 posts.pop(record_id, None)
                 removed += 1
         if removed:
-            self.data.setdefault("stats", {})["last_pruned_classroom_posts"] = removed
+            self.data.setdefault("stats", {})["last_pruned_invalid_classroom_posts"] = removed
         return removed
 
     def entity(self, name: str) -> dict[str, dict[str, Any]]:
@@ -2514,7 +2881,7 @@ class EvidenceStore:
         if not raw_text or not record_id:
             return "ignored"
         records = self.entity(entity)
-        if entity == "classroom_posts" and not classroom_cache_record_is_usable(
+        if entity == "classroom_posts" and not classroom_cache_record_is_historical(
             {"raw_text": raw_text, "metadata": dict(metadata or {}), "status": status}
         ):
             records.pop(record_id, None)
@@ -2678,7 +3045,7 @@ class EvidenceStore:
             [
                 record
                 for record in self.entity("classroom_posts").values()
-                if classroom_cache_record_is_usable(record)
+                if classroom_cache_record_is_historical(record)
             ],
             key=lambda record: (
                 str((record.get("metadata") or {}).get("topic") or ""),
@@ -2690,7 +3057,8 @@ class EvidenceStore:
         if classroom_records:
             blocks = [
                 "DETALLE DE POSTS RELEVANTES ABIERTOS EN GOOGLE CLASSROOM - 4-A - CACHE HISTORICO",
-                "Criterio: cache historico local con posts relevantes de Trabajo de clase por tema/asignatura.",
+                "Criterio: cache historico local con todos los posts relevantes ya levantados de Trabajo de clase por tema/asignatura.",
+                "Regla: este bloque conserva tambien posts antiguos o pasados; usarlo como memoria historica y no como agenda vigente.",
                 f"Fecha de corte: {current_report_date().isoformat()}",
             ]
             for index, record in enumerate(classroom_records, start=1):
@@ -2764,7 +3132,11 @@ class EvidenceStore:
 def parse_conducta_records(text: str, source: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
+    current_tipo = ""
     for line in clean_text(text).splitlines():
+        if line.startswith("VISTA SCHOOLNET CONDUCTA:"):
+            current_tipo = conducta_tipo_from_label(line)
+            continue
         if not re.match(r"^Fila (?:tabla|visual) ", line):
             continue
         parts = [part.strip() for part in line.split(" | ")]
@@ -2778,6 +3150,7 @@ def parse_conducta_records(text: str, source: str) -> list[dict[str, Any]]:
             "asignatura": parts[4] if len(parts) > 4 else "",
             "observacion": parts[5] if len(parts) > 5 else "",
             "categoria": parts[6] if len(parts) > 6 else "",
+            "tipo": current_tipo,
             "sort_date": sort_key_from_chilean_date(parts[1]),
         }
         record_id = stable_id(
@@ -2799,6 +3172,7 @@ def parse_conducta_records(text: str, source: str) -> list[dict[str, Any]]:
 def format_conducta_record_for_prompt(record: dict[str, Any]) -> str:
     metadata = record.get("metadata") or {}
     fecha = clean_text(str(metadata.get("fecha") or "No detectado"))
+    tipo = clean_text(str(metadata.get("tipo") or "No detectado"))
     motivo = clean_text(str(metadata.get("motivo") or "No detectado"))
     profesor = clean_text(str(metadata.get("profesor") or "No detectado"))
     asignatura = clean_text(str(metadata.get("asignatura") or "No detectado"))
@@ -2806,10 +3180,37 @@ def format_conducta_record_for_prompt(record: dict[str, Any]) -> str:
     categoria = clean_text(str(metadata.get("categoria") or "No detectado"))
     mensaje = observacion or "No detectado"
     return (
-        f"Anotacion | Fecha: {fecha} | Asignatura: {asignatura} | Profesor: {profesor} | "
+        f"Anotacion | Tipo: {tipo} | Fecha: {fecha} | Asignatura: {asignatura} | Profesor: {profesor} | "
         f"Categoria: {categoria} | Mensaje para mostrar: {mensaje} | "
         f"Observaciones: {observacion or 'No detectado'} | Motivo tecnico/reglamento: {motivo}"
     )
+
+
+def conducta_tipo_from_label(value: str) -> str:
+    normalized_value = normalize(value)
+    if "positiv" in normalized_value:
+        return "Positiva"
+    if "negativ" in normalized_value:
+        return "Negativa"
+    if "neutr" in normalized_value:
+        return "Neutra"
+    return ""
+
+
+def parse_conducta_counts(text: str) -> dict[str, int] | None:
+    for line in clean_text(text).splitlines():
+        match = re.search(
+            r"Anotaciones\s+Positivas\s+Anotaciones\s+Negativas\s+Anotaciones\s+Neutras\s+(\d+)\s+(\d+)\s+(\d+)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return {
+                "positivas": int(match.group(1)),
+                "negativas": int(match.group(2)),
+                "neutras": int(match.group(3)),
+            }
+    return None
 
 
 def sort_key_from_chilean_date(value: str) -> str:
@@ -2910,7 +3311,7 @@ def first_sortable_date(value: str) -> str:
 
 
 def classroom_record_status(text: str) -> str:
-    dates = extract_date_mentions(text, current_report_date())
+    dates = classroom_event_date_mentions(text, current_report_date())
     if should_skip_past_classroom_item(dates, current_report_date()):
         return "past"
     if dates:
@@ -2952,7 +3353,86 @@ CLASSROOM_DETAIL_SIGNAL_TERMS = [
     "paginas",
     "study",
     "practice",
+    "sistema locomotor",
+    "huesos",
+    "musculos",
+    "articulaciones",
 ]
+
+CLASSROOM_ATTACHMENT_CONTENT_KEYWORDS = [
+    "adjunto",
+    "archivo",
+    "drive",
+    "docs",
+    "document",
+    "documento",
+    "pdf",
+    "guia",
+    "guia",
+    "hoja de ruta",
+    "material",
+    "presentacion",
+    "slides",
+    "ppt",
+]
+
+CLASSROOM_ATTACHMENT_VIEWER_NOISE_TERMS = {
+    "google drive",
+    "google docs",
+    "google slides",
+    "google sheets",
+    "abrir con",
+    "open with",
+    "compartir",
+    "share",
+    "descargar",
+    "download",
+    "imprimir",
+    "print",
+    "zoom",
+    "ajustar a la pagina",
+    "fit to page",
+    "mas acciones",
+    "more actions",
+    "no hay vista previa disponible",
+    "no preview available",
+    "inicia sesion",
+    "sign in",
+}
+
+CLASSROOM_GENERIC_ATTACHMENT_LABEL_TERMS = [
+    "carpeta de drive de la clase",
+    "drive drive drive",
+    "documentos documentos",
+    "hojas de calculo hojas de calculo",
+    "hojas de calculo",
+    "presentaciones presentaciones",
+    "fila 1 de 3",
+    "fila 2 de 3",
+    "fila 3 de 3",
+    "se abre en una pestana nueva",
+    "google apps",
+    "aplicaciones de google",
+]
+
+
+def classroom_attachment_label_is_generic(label: str, href: str = "") -> bool:
+    normalized_label = normalize(label)
+    if not normalized_label:
+        return False
+    if any(term in normalized_label for term in CLASSROOM_GENERIC_ATTACHMENT_LABEL_TERMS):
+        return True
+    parsed = urlparse(str(href or ""))
+    host = parsed.netloc.lower()
+    path = parsed.path.rstrip("/").lower()
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if host.endswith("drive.google.com") and path in {"", "/"}:
+        return True
+    if host.endswith("docs.google.com") and path in {"/document", "/spreadsheets", "/presentation"}:
+        return True
+    if "usp" in query and str(query.get("usp") or "").endswith("_ald"):
+        return True
+    return False
 
 
 def classroom_text_is_global_noise(text: str) -> bool:
@@ -2992,20 +3472,206 @@ def classroom_text_has_detail_signal(text: str) -> bool:
     return any(term in normalized_text for term in CLASSROOM_DETAIL_SIGNAL_TERMS)
 
 
-def classroom_cache_record_is_usable(record: dict[str, Any]) -> bool:
+def classroom_attachment_kind(label: str, href: str) -> str:
+    if classroom_attachment_label_is_generic(label, href):
+        return ""
+    haystack = normalize(f"{label} {href}")
+    href_lower = str(href or "").lower()
+    parsed = urlparse(href_lower)
+    host = parsed.netloc
+    path = parsed.path
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if ".pdf" in haystack or path.endswith(".pdf"):
+        return "pdf"
+    if "docs.google" in host:
+        if "/d/" not in path:
+            return ""
+        if "/presentation/" in path:
+            return "google_slides"
+        if "/spreadsheets/" in path:
+            return "google_sheets"
+        if "/document/" in path:
+            return "google_doc"
+        return "google_docs"
+    if "drive.google" in host:
+        if path in {"", "/"} or (path == "/open" and not query.get("id")):
+            return ""
+        if "/folders/" in path:
+            return ""
+        return "google_drive"
+    if path.endswith((".doc", ".docx")):
+        return "word"
+    if path.endswith((".ppt", ".pptx")):
+        return "presentation"
+    if path.endswith((".xls", ".xlsx")):
+        return "spreadsheet"
+    if any(keyword in haystack for keyword in CLASSROOM_ATTACHMENT_CONTENT_KEYWORDS):
+        return "material"
+    return ""
+
+
+def classroom_attachment_is_openable(label: str, href: str) -> bool:
+    href = str(href or "").strip()
+    if not href or href.startswith(("javascript:", "mailto:", "#")):
+        return False
+    parsed = urlparse(href)
+    host = parsed.netloc.lower()
+    if "classroom.google." in host:
+        return False
+    return bool(classroom_attachment_kind(label, href))
+
+
+def normalize_classroom_attachment_candidates(
+    links: list[dict[str, Any]],
+    base_url: str,
+    allowed_hrefs: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        label = clean_text(str(link.get("label") or "")).replace("\n", " ")[:260]
+        raw_href = str(link.get("absolute_href") or link.get("href") or "").strip()
+        if not raw_href:
+            continue
+        absolute_href = urljoin(base_url or CLASSROOM_URL, raw_href)
+        if allowed_hrefs is not None and raw_href not in allowed_hrefs and absolute_href not in allowed_hrefs:
+            continue
+        key = normalize(f"{label}|{absolute_href}")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        kind = classroom_attachment_kind(label, absolute_href)
+        output.append(
+            {
+                "label": label,
+                "href": raw_href,
+                "absolute_href": absolute_href,
+                "kind": kind,
+                "is_pdf": kind == "pdf",
+            }
+        )
+    return output
+
+
+def compact_classroom_attachment_text(text: str, label: str = "") -> str:
+    lines = clean_text(text).splitlines()
+    output: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        clipped = line.strip()
+        if not clipped:
+            continue
+        normalized_line = normalize(clipped)
+        if normalized_line in CLASSROOM_ATTACHMENT_VIEWER_NOISE_TERMS:
+            continue
+        if any(noise in normalized_line for noise in CLASSROOM_ATTACHMENT_VIEWER_NOISE_TERMS) and len(clipped) <= 80:
+            continue
+        if normalized_line in seen:
+            continue
+        seen.add(normalized_line)
+        output.append(clipped[:500])
+        if len("\n".join(output)) >= MAX_CLASSROOM_ATTACHMENT_TEXT_CHARS:
+            break
+    compacted = "\n".join(output).strip()
+    if len(compacted) < 120:
+        return ""
+    label_norm = normalize(label)
+    if label_norm and compacted and label_norm == normalize(compacted):
+        return ""
+    return compacted[:MAX_CLASSROOM_ATTACHMENT_TEXT_CHARS].strip()
+
+
+def classroom_attachment_extracted_block_is_generic(block: str) -> bool:
+    lines = clean_text(block).splitlines()
+    if not lines:
+        return True
+    header = lines[0]
+    if header.startswith("CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:"):
+        label = header.replace("CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:", "").strip()
+        if classroom_attachment_label_is_generic(label):
+            return True
+    normalized_block = normalize(block)
+    generic_hits = sum(1 for term in CLASSROOM_GENERIC_ATTACHMENT_LABEL_TERMS if term in normalized_block)
+    content_terms = ["sistema locomotor", "unidad", "objetivo", "contenido", "prueba", "guia", "clase"]
+    content_hits = sum(1 for term in content_terms if term in normalized_block)
+    return bool(generic_hits >= 2 and content_hits == 0)
+
+
+def classroom_should_read_attachment_content(candidate: dict[str, Any], detail_text: str, today: dt.date) -> bool:
+    title = str(candidate.get("title") or "")
+    subject = str(candidate.get("subject") or "")
+    posted = str(candidate.get("posted") or "")
+    due = str(candidate.get("due") or "")
+    haystack = "\n".join([title, subject, posted, due, detail_text])
+    normalized_text = normalize(haystack)
+    if should_skip_past_classroom_item(classroom_event_date_mentions(haystack, today), today):
+        return False
+    assessment_markers = [
+        "prueba",
+        "evaluacion",
+        "control",
+        "test",
+        "exam",
+        "temario",
+        "guia de estudio",
+        "hoja de ruta",
+        "study",
+        "practice",
+    ]
+    material_markers = [
+        "sistema locomotor",
+        "ciencias naturales",
+        "cnat",
+        "unidad",
+        "material complementario",
+        "material de apoyo",
+        "repasar",
+        "estudiar",
+    ]
+    if any(marker in normalized_text for marker in assessment_markers):
+        return True
+    if "sistema locomotor" in normalized_text:
+        return True
+    return any(marker in normalized_text for marker in material_markers) and classroom_text_has_detail_signal(detail_text)
+
+
+def classroom_cache_record_is_historical(record: dict[str, Any]) -> bool:
     raw_text = clean_text(str(record.get("raw_text") or ""))
     metadata = record.get("metadata") or {}
     title = clean_text(str(metadata.get("title") or ""))
-    if not raw_text or len(raw_text) < 60:
+    if not raw_text or len(raw_text) < 20:
         return False
     if classroom_text_is_global_noise(raw_text):
         return False
     if title and is_generic_classroom_title(title):
         return False
-    if title and classroom_title_needs_complete_detail(title):
-        if len(raw_text) < 180:
+    if "CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:" in raw_text:
+        extracted_blocks = raw_text.split("CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:")
+        if any(
+            classroom_attachment_extracted_block_is_generic(
+                "CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:" + block
+            )
+            for block in extracted_blocks[1:]
+        ):
             return False
-        if not classroom_text_has_detail_signal(raw_text):
+    return True
+
+
+def classroom_cache_record_is_usable(record: dict[str, Any]) -> bool:
+    if not classroom_cache_record_is_historical(record):
+        return False
+    raw_text = clean_text(str(record.get("raw_text") or ""))
+    metadata = record.get("metadata") or {}
+    title = clean_text(str(metadata.get("title") or ""))
+    if len(raw_text) < 60:
+        return False
+    if title and classroom_title_needs_complete_detail(title):
+        has_detail_signal = classroom_text_has_detail_signal(raw_text)
+        if len(raw_text) < 180 and not has_detail_signal:
+            return False
+        if not has_detail_signal:
             return False
     return True
 
@@ -3050,8 +3716,88 @@ def schoolnet_is_grade_subject(value: str) -> bool:
     return any(schoolnet_grade_subject_key(subject) in value_key for subject in SCHOOLNET_GRADE_SUBJECTS)
 
 
+def schoolnet_grade_value(value: str) -> str:
+    value = clean_text(value).replace(".", ",")
+    return value if re.fullmatch(r"[1-7],[0-9]", value) else ""
+
+
+def schoolnet_canonical_p1_lines(rows: list[tuple[str, ...]], source: str) -> str:
+    if not rows:
+        return ""
+    lines = [
+        "CALIFICACIONES P1/P2 CANONICAS SCHOOLNET",
+        f"Fuente autoritativa para la infografia: {source}.",
+        "Regla obligatoria: copiar exactamente estos valores Asignatura | P1 | P2; P1 es primer semestre y P2 es segundo semestre. Las columnas 1, 2, 3 y 4 son notas parciales y no deben mostrarse como promedio de asignatura.",
+        "Para la infografia actual se debe usar P2 como columna principal de calificaciones porque el reporte corresponde al segundo semestre. Si P2 esta vacio porque el segundo semestre aun no tiene notas, mantener la celda en blanco. No escribir No detectado ni inferir desde otras columnas.",
+        "Si cualquier otro bloque contiene otra nota para la misma asignatura, ignorarla para la tabla de calificaciones.",
+        "Formato: Asignatura | P1 | P2",
+    ]
+    for row in rows:
+        subject = row[0] if len(row) > 0 else ""
+        p1 = row[1] if len(row) > 1 else ""
+        p2 = row[2] if len(row) > 2 else ""
+        lines.append(f"{subject} | {p1} | {p2}")
+    return "\n".join(lines)
+
+
+def schoolnet_canonical_p1_from_subject_detail(detail_text: str) -> str:
+    values: dict[str, str] = {}
+    for line in clean_text(detail_text).splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 2:
+            continue
+        normalized_parts = [schoolnet_grade_subject_key(part) for part in parts]
+        for subject in SCHOOLNET_GRADE_SUBJECTS:
+            subject_key = schoolnet_grade_subject_key(subject)
+            subject_index = next(
+                (
+                    index
+                    for index, part_key in enumerate(normalized_parts)
+                    if part_key == subject_key or subject_key in part_key
+                ),
+                -1,
+            )
+            if subject_index < 0:
+                continue
+            grades = [schoolnet_grade_value(part) for part in parts[subject_index + 1 :]]
+            grades = [grade for grade in grades if grade]
+            if grades or subject not in values:
+                values[subject] = grades[-1] if grades else ""
+
+    rows = [(subject, values.get(subject, ""), "") for subject in SCHOOLNET_GRADE_SUBJECTS]
+    if not any(row[1] for row in rows):
+        return ""
+
+    promedio = ""
+    for line in clean_text(detail_text).splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        promedio_index = next(
+            (
+                index
+                for index, part in enumerate(parts)
+                if schoolnet_grade_subject_key(part) == "promedios"
+                or schoolnet_grade_subject_key(part).startswith("promedios ")
+            ),
+            -1,
+        )
+        if promedio_index < 0:
+            continue
+        grades = [schoolnet_grade_value(part) for part in parts[promedio_index + 1 :]]
+        grades = [grade for grade in grades if grade]
+        if grades:
+            promedio = grades[-1]
+            break
+    if promedio:
+        rows.append(("Promedio", promedio, ""))
+
+    return schoolnet_canonical_p1_lines(
+        rows,
+        "columnas P1/P2 reconstruidas desde el detalle visual por asignatura de SchoolNet",
+    )
+
+
 def schoolnet_canonical_p1_from_detail(detail_text: str) -> str:
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for line in clean_text(detail_text).splitlines():
         parts = [part.strip() for part in line.split("|")]
@@ -3060,10 +3806,11 @@ def schoolnet_canonical_p1_from_detail(detail_text: str) -> str:
         row_type = normalize(parts[0])
         subject = clean_text(parts[2])
         p1 = clean_text(parts[7])
+        p2 = clean_text(parts[8]) if len(parts) > 8 else ""
         if not subject:
             continue
         if row_type == "promedio":
-            label = "Promedio P1"
+            label = "Promedio"
         elif row_type == "asignatura" or (row_type == "item" and schoolnet_is_grade_subject(subject)):
             label = subject
         else:
@@ -3072,49 +3819,97 @@ def schoolnet_canonical_p1_from_detail(detail_text: str) -> str:
         if key in seen:
             continue
         seen.add(key)
-        rows.append((label, p1))
-    if not rows:
-        return ""
-    lines = [
+        rows.append((label, p1, p2))
+    if rows:
+        return schoolnet_canonical_p1_lines(
+            rows,
+            "columnas P1/P2 del bloque visual estructurado de SchoolNet",
+        )
+    return schoolnet_canonical_p1_from_subject_detail(detail_text)
+
+
+def schoolnet_existing_canonical_p1(text: str) -> str:
+    lines = clean_text(text).splitlines()
+    canonical_headers = {
+        "CALIFICACIONES P1/P2 CANONICAS SCHOOLNET",
         "CALIFICACIONES P1 CANONICAS SCHOOLNET",
-        "Fuente: columna P1 del bloque visual estructurado de SchoolNet.",
-        "Regla: usar estos valores para la infografia; las columnas 1, 2 y 3 son notas parciales, no promedios.",
-        "Formato: Asignatura | P1",
+    }
+    start_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.strip() in canonical_headers
+        ),
+        -1,
+    )
+    if start_index < 0:
+        return ""
+
+    block: list[str] = []
+    stop_prefixes = (
+        "DETALLE ",
+        "LECTURA ",
+        "TEXTO CRUDO",
+        "RESUMEN ",
+        "PROXIMAS ",
+        "SALIDA ",
+        "----- ",
+    )
+    for line in lines[start_index:]:
+        if block and line.startswith(stop_prefixes):
+            break
+        block.append(line)
+
+    if not any(
+        " | " in line and schoolnet_is_grade_subject(line.split("|", 1)[0])
+        for line in block
+    ):
+        return ""
+    return schoolnet_ensure_canonical_p1_p2("\n".join(block))
+
+
+def schoolnet_ensure_canonical_p1_p2(text: str) -> str:
+    lines = clean_text(text).splitlines()
+    if not lines:
+        return ""
+    if lines[0].strip() == "CALIFICACIONES P1/P2 CANONICAS SCHOOLNET":
+        return "\n".join(lines)
+    if lines[0].strip() != "CALIFICACIONES P1 CANONICAS SCHOOLNET":
+        return "\n".join(lines)
+
+    output = [
+        "CALIFICACIONES P1/P2 CANONICAS SCHOOLNET",
+        "Fuente autoritativa para la infografia: bloque P1 historico convertido a P1/P2.",
+        "Regla obligatoria: copiar exactamente estos valores Asignatura | P1 | P2; P1 es primer semestre y P2 es segundo semestre. P2 queda en blanco si no fue detectado.",
+        "Para la infografia actual se debe usar P2 como columna principal de calificaciones porque el reporte corresponde al segundo semestre. Si P2 esta vacio porque el segundo semestre aun no tiene notas, mantener la celda en blanco. No escribir No detectado ni inferir desde otras columnas.",
+        "Formato: Asignatura | P1 | P2",
     ]
-    lines.extend(f"{subject} | {p1}" for subject, p1 in rows)
-    return "\n".join(lines)
+    for line in lines:
+        if " | " not in line:
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if not parts or not schoolnet_is_grade_subject(parts[0]):
+            continue
+        subject = parts[0]
+        p1 = parts[1] if len(parts) > 1 else ""
+        p2 = parts[2] if len(parts) > 2 else ""
+        output.append(f"{subject} | {p1} | {p2}")
+    return "\n".join(output)
 
 
 def schoolnet_prefer_canonical_p1(text: str) -> str:
     text = clean_text(text)
+    existing_canonical = schoolnet_existing_canonical_p1(text)
+    if existing_canonical:
+        return existing_canonical
     canonical = schoolnet_canonical_p1_from_detail(text)
     if not canonical:
         return text
-    cleaned_lines: list[str] = []
-    skipping = False
-    for line in text.splitlines():
-        normalized_line = normalize(line)
-        starts_conflicting_p1 = normalized_line == "lectura estructurada schoolnet calificaciones p1"
-        starts_existing_canonical = normalized_line == "calificaciones p1 canonicas schoolnet"
-        if starts_conflicting_p1 or starts_existing_canonical:
-            skipping = True
-            continue
-        if skipping and (
-            normalized_line.startswith("detalle crudo estructurado schoolnet calificaciones")
-            or normalized_line.startswith("detalle por asignatura schoolnet calificaciones")
-            or normalized_line.startswith("texto crudo visible")
-            or normalized_line.startswith("lectura cruda")
-        ):
-            skipping = False
-        if skipping:
-            continue
-        cleaned_lines.append(line)
-    cleaned = "\n".join(cleaned_lines).strip()
-    return f"{canonical}\n\n{cleaned}".strip()
+    return canonical
 
 
 class BrowserController:
-    def __init__(self) -> None:
+    def __init__(self, headless: bool | None = None) -> None:
         self._lock = threading.RLock()
         self._worker_thread: threading.Thread | None = None
         self._worker_queue: queue.Queue[Any] = queue.Queue()
@@ -3124,9 +3919,18 @@ class BrowserController:
         self._progress_running = False
         self._playwright: Any | None = None
         self._context: Any | None = None
+        # A CDP context belongs to the long-lived browser/noVNC session, not to
+        # this short-lived report run.  It must be detached, never closed.
+        self._cdp_attached = False
         self._browser_started_at: float | None = None
         self._evidence_store: EvidenceStore | None = None
         self._force_full_scan = False
+        self._headless = env_flag(HEADLESS_ENV) if headless is None else headless
+        self._classroom_material_records: list[dict[str, Any]] = []
+        self._classroom_material_seen: set[str] = set()
+        self._classroom_material_subject_counts: dict[str, int] = {}
+        self._classroom_materials_dir: Path | None = None
+        self._classroom_material_files_dir: Path | None = None
 
     def _ensure_worker_thread(self) -> None:
         with self._lock:
@@ -3202,24 +4006,45 @@ class BrowserController:
                 "events": list(self._progress_events),
             }
 
-    def _browser_path(self) -> Path:
+    def _browser_path(self) -> Path | None:
+        configured = os.environ.get(BROWSER_EXE_ENV, "").strip()
+        if configured.lower() in {"playwright", "bundled", "default"}:
+            return None
+        if configured:
+            configured_path = Path(configured)
+            if configured_path.exists():
+                return configured_path
+            resolved = shutil.which(configured)
+            if resolved:
+                return Path(resolved)
+            raise AppError(f"No encontre el navegador configurado en {BROWSER_EXE_ENV}.")
         if CHROME_EXE.exists():
             return CHROME_EXE
         if EDGE_EXE.exists():
             return EDGE_EXE
-        raise AppError(
-            "No encontre Chrome ni Edge instalados en las rutas esperadas. "
-            "Instala Chrome o ajusta CHROME_EXE en resumen_escolar/app.py."
-        )
+        for candidate in (
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium-browser",
+            "chromium",
+            "microsoft-edge",
+            "msedge",
+        ):
+            resolved = shutil.which(candidate)
+            if resolved:
+                return Path(resolved)
+        return None
 
     def _discard_browser_state(self) -> None:
         context = self._context
         playwright = self._playwright
         self._context = None
         self._playwright = None
+        cdp_attached = self._cdp_attached
+        self._cdp_attached = False
         self._browser_started_at = None
 
-        if context is not None:
+        if context is not None and not cdp_attached:
             try:
                 context.close()
             except Exception:
@@ -3249,23 +4074,42 @@ class BrowserController:
                     "python -m pip install --target .runtime\\site-packages playwright"
                 ) from exc
 
-            RUNTIME_DIR.mkdir(exist_ok=True)
             configure_runtime_environment()
-            profile_dir = RUNTIME_DIR / "chrome-profile"
+            cdp_url = os.environ.get(CDP_URL_ENV, "").strip()
+            self._playwright = sync_playwright().start()
+            if cdp_url:
+                browser = self._playwright.chromium.connect_over_cdp(cdp_url)
+                contexts = list(browser.contexts)
+                if not contexts:
+                    raise AppError(f"El navegador CDP no tiene contextos disponibles: {cdp_url}")
+                self._context = contexts[0]
+                self._cdp_attached = True
+                self._browser_started_at = time.time()
+                return
+
+            RUNTIME_DIR.mkdir(exist_ok=True)
+            configured_profile = os.environ.get(PROFILE_DIR_ENV, "").strip()
+            profile_dir = Path(configured_profile) if configured_profile else RUNTIME_DIR / "chrome-profile"
             profile_dir.mkdir(exist_ok=True)
 
             browser_path = self._browser_path()
-            self._playwright = sync_playwright().start()
-            self._context = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                executable_path=str(browser_path),
-                headless=False,
-                viewport=None,
-                args=[
-                    "--start-maximized",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
+            launch_args = ["--disable-blink-features=AutomationControlled"]
+            viewport: dict[str, int] | None = None
+            if self._headless:
+                launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+                viewport = {"width": 1600, "height": 1000}
+            else:
+                launch_args.insert(0, "--start-maximized")
+            launch_options: dict[str, Any] = {
+                "user_data_dir": str(profile_dir),
+                "headless": self._headless,
+                "viewport": viewport,
+                "args": launch_args,
+            }
+            if browser_path is not None:
+                launch_options["executable_path"] = str(browser_path)
+            self._context = self._playwright.chromium.launch_persistent_context(**launch_options)
+            self._cdp_attached = False
             self._browser_started_at = time.time()
 
     def open_platforms(self) -> dict[str, Any]:
@@ -3298,8 +4142,10 @@ class BrowserController:
         if schoolnet_page is None:
             schoolnet_page = self._context.new_page()
             schoolnet_page.goto(SCHOOLNET_URL, wait_until="domcontentloaded")
+            self._login_schoolnet_if_needed(schoolnet_page)
         else:
             schoolnet_page.bring_to_front()
+            self._login_schoolnet_if_needed(schoolnet_page)
 
         if classroom_page is None:
             classroom_page = self._context.new_page()
@@ -3374,7 +4220,9 @@ class BrowserController:
         try:
             for attempt in range(2):
                 try:
+                    self._reset_classroom_material_capture()
                     snapshots = self._targeted_snapshots_once()
+                    snapshots.append(self._finalize_classroom_material_capture(snapshots))
                     self._finish_progress("Generacion: terminado")
                     return snapshots
                 except Exception as exc:
@@ -3419,35 +4267,251 @@ class BrowserController:
         schoolnet_page = self._find_page(pages, "schoolnet")
         classroom_page = self._find_page(pages, "classroom.google")
 
+        calendar_page = self._context.new_page()
+        try:
+            snapshots.append(self._snapshot_sscc_calendar_page(calendar_page))
+        finally:
+            try:
+                calendar_page.close()
+            except Exception:
+                pass
+
         if schoolnet_page is None:
             schoolnet_page = self._context.new_page()
             schoolnet_page.goto(SCHOOLNET_URL, wait_until="domcontentloaded")
-            snapshots.append(
-                self._message_snapshot(
-                    "SchoolNet",
-                    SCHOOLNET_URL,
-                    "needs_login",
-                    ["Abri SchoolNet. Inicia sesion y vuelve a generar para leer Conducta y Calificaciones."],
-                )
-            )
+            snapshots.extend(self._collect_schoolnet_snapshots_or_login_message(schoolnet_page))
         else:
-            snapshots.extend(self._collect_schoolnet_snapshots(schoolnet_page))
+            snapshots.extend(self._collect_schoolnet_snapshots_or_login_message(schoolnet_page))
 
         if classroom_page is None:
             classroom_page = self._context.new_page()
             classroom_page.goto(CLASSROOM_4A_CLASSWORK_URL, wait_until="domcontentloaded")
-            snapshots.append(
-                self._message_snapshot(
-                    "Google Classroom - 4-A",
-                    CLASSROOM_4A_CLASSWORK_URL,
-                    "needs_login",
-                    ["Abri Classroom 4-A Trabajo de clase. Inicia sesion y vuelve a generar si hace falta."],
-                )
-            )
+            snapshots.extend(self._collect_classroom_snapshots(classroom_page))
         else:
             snapshots.extend(self._collect_classroom_snapshots(classroom_page))
 
         return snapshots
+
+    def _snapshot_sscc_calendar_page(self, page: Any) -> PageSnapshot:
+        notes: list[str] = []
+        title = "Calendario Segundo Ciclo"
+        url = getattr(page, "url", "") or SSCC_CALENDAR_URL
+        status = "ok"
+        text = ""
+        stats: dict[str, Any] = {}
+
+        step_started = self._progress("Calendario SSCC: leer eventos 4A")
+        try:
+            try:
+                events, stats = fetch_sscc_calendar_ics_4a_events()
+                title = "Calendario Evaluaciones SSCC 4A"
+                url = SSCC_CALENDAR_4A_ICS_URL
+                notes.append("Calendario leido desde feed iCal publico estructurado.")
+            except Exception as ics_exc:
+                notes.append(f"No pude leer el feed iCal del calendario SSCC; use respaldo Playwright: {ics_exc}")
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                page.goto(SSCC_CALENDAR_URL, wait_until="domcontentloaded", timeout=20000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                try:
+                    title = page.title()
+                except Exception:
+                    title = "Calendario Segundo Ciclo"
+                events, stats = self._extract_sscc_calendar_4a_events(page)
+            if events:
+                window_start = str(stats.get("calendar_window_start") or current_report_date().isoformat())
+                window_end = str(stats.get("calendar_window_end") or add_calendar_months(current_report_date(), 1).isoformat())
+                lines = [
+                    "EVENTOS CALENDARIO SSCC SEGUNDO CICLO - FILTRO 4A",
+                    "Fuente: feed iCal publico del calendario Google Calendar de evaluaciones SSCC 4A.",
+                    "Regla: usar estos eventos como fuente oficial adicional de fechas de tareas, pruebas y actividades para 4A.",
+                    f"Ventana aplicada: solo eventos entre {window_start} y {window_end}.",
+                    "Formato: Evento | Fuente | Texto visible",
+                ]
+                for index, event in enumerate(events[:MAX_SSCC_CALENDAR_EVENTS], start=1):
+                    dates = event.get("dates")
+                    date_suffix = f" | Fechas detectadas: {dates}" if dates else ""
+                    lines.append(f"Evento {index} | {event['source']} | {event['text']}{date_suffix}")
+                text = "\n".join(lines)
+                notes.append(f"Detecte {len(events)} eventos o lineas del calendario que mencionan 4A.")
+            else:
+                status = "empty"
+                window_start = str(stats.get("calendar_window_start") or current_report_date().isoformat())
+                window_end = str(stats.get("calendar_window_end") or add_calendar_months(current_report_date(), 1).isoformat())
+                text = (
+                    "No detecte eventos visibles que mencionen 4A en el calendario SSCC Segundo Ciclo "
+                    f"dentro de la ventana {window_start} a {window_end}."
+                )
+                notes.append("No aparecieron eventos 4A vigentes en la vista visible ni en la vista agenda del calendario.")
+            self._progress_done("Calendario SSCC: leer eventos 4A", step_started, f"eventos={len(events)}")
+        except Exception as exc:
+            status = "error"
+            stats = stats or {}
+            text = ""
+            notes.append(f"No pude leer el calendario SSCC Segundo Ciclo: {exc}")
+            self._progress_done("Calendario SSCC: leer eventos 4A", step_started, "error")
+
+        return PageSnapshot(
+            platform="Calendario SSCC Segundo Ciclo - 4A",
+            title=title or "Calendario Segundo Ciclo",
+            url=getattr(page, "url", "") or url,
+            text=text,
+            status=status,
+            notes=notes,
+            stats=stats,
+        )
+
+    def _extract_sscc_calendar_4a_events(self, page: Any) -> tuple[list[dict[str, str]], dict[str, Any]]:
+        events: list[dict[str, str]] = []
+        sources: list[dict[str, Any]] = []
+        frame_errors = 0
+
+        def add_events(frame_label: str, frame_url: str, rows: Any) -> None:
+            nonlocal frame_errors
+            if not isinstance(rows, list):
+                return
+            added = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                text = clean_text(str(row.get("text") or ""))
+                if not text:
+                    continue
+                events.append(
+                    {
+                        "source": frame_label,
+                        "url": frame_url,
+                        "text": text,
+                    }
+                )
+                added += 1
+            if added:
+                sources.append(
+                    {
+                        "source": frame_label,
+                        "kind": "calendar_4a_events",
+                        "events": added,
+                        "url": frame_url[:180],
+                    }
+                )
+
+        for index, frame in enumerate(list(getattr(page, "frames", []) or [])):
+            frame_label = "main" if index == 0 else f"iframe {index}"
+            frame_url = getattr(frame, "url", "") or ""
+            try:
+                add_events(frame_label, frame_url, frame.evaluate(SSCC_CALENDAR_4A_EXTRACT_SCRIPT))
+            except Exception:
+                frame_errors += 1
+
+        agenda_urls = self._sscc_calendar_agenda_urls(page)
+        for index, agenda_url in enumerate(agenda_urls[:4], start=1):
+            assert self._context is not None
+            target = self._context.new_page()
+            try:
+                target.goto(agenda_url, wait_until="domcontentloaded", timeout=20000)
+                try:
+                    target.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                try:
+                    target.wait_for_function(
+                        "() => document.body && document.body.innerText.trim().length > 20",
+                        timeout=8000,
+                    )
+                except Exception:
+                    pass
+                for frame_index, frame in enumerate(list(getattr(target, "frames", []) or [])):
+                    frame_label = f"agenda {index}" if frame_index == 0 else f"agenda {index} iframe {frame_index}"
+                    frame_url = getattr(frame, "url", "") or agenda_url
+                    try:
+                        add_events(frame_label, frame_url, frame.evaluate(SSCC_CALENDAR_4A_EXTRACT_SCRIPT))
+                    except Exception:
+                        frame_errors += 1
+            except Exception:
+                frame_errors += 1
+            finally:
+                try:
+                    target.close()
+                except Exception:
+                    pass
+
+        deduped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for event in events:
+            key = normalize(event["text"])
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(event)
+
+        today = current_report_date()
+        window_end = add_calendar_months(today, SSCC_CALENDAR_LOOKAHEAD_MONTHS)
+        filtered: list[dict[str, str]] = []
+        excluded = {
+            "past": 0,
+            "future": 0,
+            "unknown_date": 0,
+            "outside_window": 0,
+        }
+        for event in deduped:
+            include, reason, mentions = sscc_calendar_event_in_window(event["text"], today, window_end)
+            if include:
+                formatted_dates = format_date_mentions(mentions)
+                filtered.append({**event, "dates": formatted_dates})
+            else:
+                excluded[reason] = excluded.get(reason, 0) + 1
+
+        return filtered[:MAX_SSCC_CALENDAR_EVENTS], {
+            "frames_seen": len(list(getattr(page, "frames", []) or [])),
+            "frame_errors": frame_errors,
+            "source_count": len(sources),
+            "calendar_events_4a_raw": len(deduped),
+            "calendar_events_4a": len(filtered),
+            "calendar_window_start": today.isoformat(),
+            "calendar_window_end": window_end.isoformat(),
+            "calendar_filtered_past": excluded.get("past", 0),
+            "calendar_filtered_future": excluded.get("future", 0),
+            "calendar_filtered_unknown_date": excluded.get("unknown_date", 0),
+            "calendar_filtered_outside_window": excluded.get("outside_window", 0),
+            "agenda_urls_checked": len(agenda_urls[:4]),
+            "sources": sources[:12],
+        }
+
+    def _sscc_calendar_agenda_urls(self, page: Any) -> list[str]:
+        iframe_urls: list[str] = []
+        try:
+            raw_urls = page.evaluate(
+                "() => Array.from(document.querySelectorAll('iframe')).map((iframe) => iframe.src || iframe.getAttribute('src') || '').filter(Boolean)"
+            )
+            if isinstance(raw_urls, list):
+                iframe_urls = [urljoin(SSCC_CALENDAR_URL, str(url)) for url in raw_urls if str(url).strip()]
+        except Exception:
+            iframe_urls = []
+
+        urls: list[str] = []
+        for url in iframe_urls:
+            agenda_url = self._as_google_calendar_agenda_url(url)
+            if agenda_url and agenda_url not in urls:
+                urls.append(agenda_url)
+        return urls
+
+    @staticmethod
+    def _as_google_calendar_agenda_url(url: str) -> str:
+        parsed = urlparse(url)
+        if "calendar.google" not in parsed.netloc.lower():
+            return ""
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query["mode"] = "AGENDA"
+        query.setdefault("ctz", "America/Santiago")
+        query.setdefault("hl", "es")
+        query.setdefault("showPrint", "0")
+        query.setdefault("showCalendars", "0")
+        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
     def _collect_schoolnet_snapshots(self, page: Any) -> list[PageSnapshot]:
         snapshots: list[PageSnapshot] = []
@@ -3461,15 +4525,288 @@ class BrowserController:
                 "No pude encontrar/clickear la seccion Conducta automaticamente. Dejala abierta manualmente y vuelve a generar.",
             )
         )
-        snapshots.append(
-            self._navigate_and_snapshot(
+        grade_snapshot = self._navigate_and_snapshot(
+            page,
+            "SchoolNet - Calificaciones",
+            SCHOOLNET_CALIFICACIONES_TERMS,
+            "No pude encontrar/clickear la seccion Calificaciones automaticamente. Dejala abierta manualmente y vuelve a generar.",
+        )
+        for attempt in range(2, 4):
+            if grade_snapshot.status == "needs_login" or schoolnet_existing_canonical_p1(grade_snapshot.text):
+                break
+            self._progress(f"SchoolNet: reintentando tabla de calificaciones ({attempt}/3)")
+            if attempt == 3:
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=10_000)
+                except Exception:
+                    pass
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                time.sleep(1.5)
+            grade_snapshot = self._navigate_and_snapshot(
                 page,
                 "SchoolNet - Calificaciones",
                 SCHOOLNET_CALIFICACIONES_TERMS,
                 "No pude encontrar/clickear la seccion Calificaciones automaticamente. Dejala abierta manualmente y vuelve a generar.",
             )
-        )
+        if grade_snapshot.status != "needs_login" and not schoolnet_existing_canonical_p1(grade_snapshot.text):
+            grade_snapshot.status = "error"
+            grade_snapshot.notes.append(
+                "No pude construir la tabla canonica P1/P2 despues de 3 intentos; se conserva el ultimo reporte valido."
+            )
+        snapshots.append(grade_snapshot)
         return snapshots
+
+    def _collect_schoolnet_snapshots_or_login_message(self, page: Any) -> list[PageSnapshot]:
+        from .automation import format_login_diagnostics, schoolnet_retry_delays
+        from .recovery import RecoveryAction, RecoverySignal, classify_failure, decide_next
+
+        attempts: list[dict[str, Any]] = []
+        recovery_history: list[str] = [RecoveryAction.WAIT_FOR_FORM.value]
+
+        def login_with_budget(*, immediate_first_attempt: bool = False) -> dict[str, Any]:
+            nonlocal page
+            delays = schoolnet_retry_delays()
+            last: dict[str, Any] = {"ok": False, "status": "login_failed"}
+            start_index = len(attempts)
+            for offset, delay in enumerate(delays[start_index:], start=start_index):
+                attempt_number = offset + 1
+                if delay and not (immediate_first_attempt and offset == start_index):
+                    self._progress(f"SchoolNet: esperando reintento {attempt_number}/6")
+                    time.sleep(delay)
+                last = self._login_schoolnet_if_needed(page)
+                attempts.append(
+                    {
+                        "attempt": attempt_number,
+                        "stage": "automatic_login",
+                        "result": "ok" if last.get("ok") else str(last.get("status") or "failed"),
+                        "url": getattr(page, "url", "") or SCHOOLNET_URL,
+                        "note": str(last.get("note") or "")[:180],
+                    }
+                )
+                if last.get("ok"):
+                    return last
+                if last.get("status") == "missing_credentials":
+                    break
+                category = classify_failure(str(last.get("note") or last.get("status") or ""))
+                now = dt.datetime.now(dt.timezone.utc)
+                decision = decide_next(
+                    RecoverySignal(
+                        now=now,
+                        deadline=now + dt.timedelta(hours=3),
+                        category=category,
+                        authenticated=False,
+                        form_ready=False,
+                        username_field_present=False,
+                        password_field_present=False,
+                        submit_present=False,
+                        document_ready=True,
+                        cdp_ready=True,
+                        profile_ready=True,
+                        novnc_active=False,
+                        page_count=len(getattr(self._context, "pages", []) or []),
+                        frame_count=0,
+                        visible_input_count=0,
+                        browser_restart_count=0,
+                        last_browser_restart_at=None,
+                        action_history=tuple(recovery_history),
+                    )
+                )
+                if decision.terminal:
+                    last["status"] = decision.category
+                    last["note"] = f"{last.get('note') or ''} Recuperacion detenida: {decision.reason}".strip()
+                    attempts[-1]["recovery_action"] = decision.action.value
+                    attempts[-1]["recovery_reason"] = decision.reason
+                    break
+                recovered_page = self._apply_schoolnet_recovery_action(page, decision.action)
+                recovery_history.append(decision.action.value)
+                attempts[-1]["recovery_action"] = decision.action.value
+                attempts[-1]["recovery_result"] = "ok" if recovered_page is not None else "failed"
+                if recovered_page is not None:
+                    page = recovered_page
+            diagnostics = format_login_diagnostics(
+                run_id=f"schoolnet-{int(time.time())}",
+                attempts=attempts,
+                vault_status="available" if self._schoolnet_credentials() else "missing",
+                cdp_status="ready",
+                profile_status="reused",
+                final_reason=str(last.get("status") or "login_failed"),
+            )
+            last["note"] = f"{last.get('note') or 'No se recupero la sesion.'} | {diagnostics}"
+            return last
+
+        login = login_with_budget()
+        if login.get("ok"):
+            snapshots = self._collect_schoolnet_snapshots(page)
+            redirected_to_login = any(
+                snapshot.status == "needs_login" and login_status_note(snapshot.platform, snapshot.url, snapshot.text)
+                for snapshot in snapshots
+            )
+            if not redirected_to_login:
+                return snapshots
+
+            retry_login = login_with_budget(immediate_first_attempt=True)
+            if retry_login.get("ok") and retry_login.get("attempted"):
+                retried_snapshots = self._collect_schoolnet_snapshots(page)
+                still_blocked = any(snapshot.status == "needs_login" for snapshot in retried_snapshots)
+                for snapshot in retried_snapshots:
+                    snapshot.notes.insert(
+                        0,
+                        (
+                            "SchoolNet sigue requiriendo login tras reintentar la vista interna."
+                            if still_blocked else
+                            "SchoolNet redirigio a login al abrir una vista interna; se recupero la sesion desde Vault y se reintento la lectura."
+                        ),
+                    )
+                return retried_snapshots
+
+            retry_note = str(retry_login.get("note") or "No pude recuperar la sesion al abrir una vista interna de SchoolNet.")
+            for snapshot in snapshots:
+                if snapshot.status == "needs_login":
+                    snapshot.notes.insert(0, f"Re-login automatico tras redireccion interna: {retry_note}")
+            return snapshots
+        status = "needs_login" if login.get("status") == "missing_credentials" else "error"
+        note = str(login.get("note") or "No pude iniciar sesion automaticamente en SchoolNet.")
+        return [
+            self._message_snapshot(
+                "SchoolNet",
+                getattr(page, "url", "") or SCHOOLNET_URL,
+                status,
+                [note],
+            )
+        ]
+
+    def _apply_schoolnet_recovery_action(self, page: Any, action: Any) -> Any | None:
+        """Cambia el estado de la pestaña antes de otro login; nunca repite el mismo DOM."""
+        action_name = getattr(action, "value", str(action))
+        started = self._progress(f"SchoolNet: recuperacion {action_name}")
+        try:
+            if action_name == "wait_for_form":
+                page.wait_for_timeout(5000)
+                result = page
+            elif action_name == "reload_page":
+                page.reload(wait_until="domcontentloaded", timeout=15000)
+                result = page
+            elif action_name == "navigate_login":
+                page.goto(SCHOOLNET_URL, wait_until="domcontentloaded", timeout=15000)
+                result = page
+            elif action_name == "replace_page":
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                assert self._context is not None
+                result = self._context.new_page()
+                result.goto(SCHOOLNET_URL, wait_until="domcontentloaded", timeout=15000)
+            elif action_name == "reconnect_cdp":
+                self._discard_browser_state()
+                self.ensure_started()
+                assert self._context is not None
+                result = self._find_page(list(self._context.pages), "schoolnet")
+                if result is None:
+                    result = self._context.new_page()
+                    result.goto(SCHOOLNET_URL, wait_until="domcontentloaded", timeout=15000)
+            else:
+                self._progress_done(f"SchoolNet: recuperacion {action_name}", started, "accion no automatizable")
+                return None
+            self._wait_after_interaction(result)
+            self._progress_done(f"SchoolNet: recuperacion {action_name}", started, "ok")
+            return result
+        except Exception as exc:
+            self._progress_done(f"SchoolNet: recuperacion {action_name}", started, "fallo")
+            return None
+
+    def _schoolnet_credentials(self) -> tuple[str, str] | None:
+        username = os.environ.get(SCHOOLNET_USERNAME_ENV, "").strip()
+        password = os.environ.get(SCHOOLNET_PASSWORD_ENV, "")
+        if not username or not password:
+            return None
+        return username, password
+
+    def _schoolnet_login_note(self, page: Any) -> str | None:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        try:
+            text = page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            text = ""
+        return login_status_note("SchoolNet", getattr(page, "url", "") or "", text)
+
+    def _login_schoolnet_if_needed(self, page: Any) -> dict[str, Any]:
+        login_note = self._schoolnet_login_note(page)
+        if not login_note:
+            return {"ok": True, "attempted": False}
+
+        credentials = self._schoolnet_credentials()
+        if credentials is None:
+            return {
+                "ok": False,
+                "status": "missing_credentials",
+                "note": (
+                    "SchoolNet requiere login y no hay credenciales configuradas. "
+                    f"Configura {SCHOOLNET_USERNAME_ENV}/{SCHOOLNET_PASSWORD_ENV} o OCI Vault."
+                ),
+            }
+
+        username, password = credentials
+        step_started = self._progress("SchoolNet: login automatico")
+        try:
+            result = page.evaluate(
+                SCHOOLNET_LOGIN_SCRIPT,
+                {"username": username, "password": password},
+            )
+        except Exception as exc:
+            self._progress_done("SchoolNet: login automatico", step_started, "fallo al completar formulario")
+            return {
+                "ok": False,
+                "status": "login_failed",
+                "note": f"No pude completar el formulario de login SchoolNet: {exc}",
+            }
+
+        if not isinstance(result, dict) or not result.get("filled_user") or not result.get("filled_password"):
+            self._progress_done("SchoolNet: login automatico", step_started, "formulario no detectado")
+            return {
+                "ok": False,
+                "status": "login_failed",
+                "note": "No pude detectar campos de usuario/clave en la pantalla de login SchoolNet.",
+            }
+        if not result.get("clicked_submit"):
+            self._progress_done("SchoolNet: login automatico", step_started, "boton no detectado")
+            return {
+                "ok": False,
+                "status": "login_failed",
+                "note": "Complete usuario/clave de SchoolNet, pero no pude detectar el boton de ingreso.",
+            }
+
+        self._wait_after_interaction(page)
+        for _attempt in range(10):
+            if not self._schoolnet_login_note(page):
+                self._progress_done("SchoolNet: login automatico", step_started, "sesion iniciada")
+                return {"ok": True, "attempted": True, "checked_remember": bool(result.get("checked_remember"))}
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                time.sleep(1)
+
+        rejection_note = ""
+        try:
+            body_text = single_line(page.locator("body").inner_text(timeout=2000))
+            if body_text:
+                rejection_note = f" Mensaje visible: {body_text[:180]}"
+        except Exception:
+            pass
+        self._progress_done("SchoolNet: login automatico", step_started, "sigue en login")
+        return {
+            "ok": False,
+            "status": "login_failed",
+            "note": (
+                "SchoolNet siguio mostrando login despues de completar credenciales desde Vault."
+                + rejection_note
+            ),
+        }
 
     def _collect_classroom_snapshots(self, page: Any) -> list[PageSnapshot]:
         notes: list[str] = []
@@ -3489,14 +4826,35 @@ class BrowserController:
             f"url={getattr(page, 'url', '') or 'sin url'}",
         )
 
+        if "accounts.google.com" in (getattr(page, "url", "") or "").lower():
+            login = self._login_classroom_if_needed(page)
+            if not login.get("ok"):
+                notes.append(f"Google login {login.get('status', 'manual_required')}: {login.get('note', 'Revisar Chrome de la VM.')}")
+                return [self._message_snapshot(
+                    "Google Classroom - 4-A - Trabajo de clase",
+                    getattr(page, "url", "") or "",
+                    "needs_login",
+                    notes,
+                )]
+            notes.append("Google inicio sesion desde OCI Vault en Chrome de la VM.")
+            try:
+                page.goto(CLASSROOM_4A_CLASSWORK_URL, wait_until="domcontentloaded", timeout=10000)
+                self._wait_after_classroom_interaction(page)
+            except Exception as exc:
+                notes.append(f"No pude volver a Trabajo de clase tras el login de Google: {exc}")
+
         if not self._is_classroom_4a_listing_page(page):
             url = getattr(page, "url", "") or ""
-            notes.append(f"Bloqueo: Classroom quedo en una ruta global o incorrecta, no en Trabajo de clase 4-A: {url}")
+            login_note = login_status_note("Google Classroom", url, "")
+            if login_note:
+                notes.append(login_note)
+            else:
+                notes.append(f"Bloqueo: Classroom quedo en una ruta global o incorrecta, no en Trabajo de clase 4-A: {url}")
             snapshots.append(
                 self._message_snapshot(
                     "Google Classroom - 4-A - Trabajo de clase",
                     url,
-                    "error",
+                    "needs_login" if login_note else "error",
                     notes,
                 )
             )
@@ -3544,6 +4902,47 @@ class BrowserController:
         snapshots.append(fallback)
         return snapshots
 
+    def _login_classroom_if_needed(self, page: Any) -> dict[str, Any]:
+        from .google_login import login_google_page
+
+        username = os.environ.get("RESUMEN_ESCOLAR_GOOGLE_USERNAME", "").strip()
+        password = os.environ.get("RESUMEN_ESCOLAR_GOOGLE_PASSWORD", "")
+        return login_google_page(page, username, password)
+
+    def _classroom_topic_include_terms(self) -> list[str]:
+        return env_terms(CLASSROOM_TOPIC_INCLUDE_ENV)
+
+    def _classroom_topic_is_included(self, label: str) -> bool:
+        include_terms = self._classroom_topic_include_terms()
+        if not include_terms:
+            return True
+        normalized_label = normalize(label)
+        return any(term in normalized_label or normalized_label in term for term in include_terms)
+
+    def _filtered_classroom_topic_labels(self, topic_labels: list[str]) -> tuple[list[str], list[str]]:
+        included: list[str] = []
+        omitted: list[str] = []
+        for label in topic_labels:
+            if self._classroom_topic_is_included(label):
+                included.append(label)
+            else:
+                omitted.append(label)
+        return included, omitted
+
+    def _filtered_classroom_topic_links(
+        self,
+        topic_links: list[dict[str, str]],
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        included: list[dict[str, str]] = []
+        omitted: list[str] = []
+        for topic in topic_links:
+            label = clean_text(str(topic.get("label") or "Tema Classroom")).replace("\n", " ")
+            if self._classroom_topic_is_included(label):
+                included.append(topic)
+            else:
+                omitted.append(label)
+        return included, omitted
+
     def _collect_classroom_topic_snapshots(
         self,
         page: Any,
@@ -3551,6 +4950,19 @@ class BrowserController:
         classwork_url: str,
     ) -> list[PageSnapshot]:
         snapshots: list[PageSnapshot] = []
+        topic_labels, omitted_labels = self._filtered_classroom_topic_labels(topic_labels)
+        if omitted_labels:
+            snapshots.append(
+                self._message_snapshot(
+                    "Google Classroom - 4-A - Trabajo de clase - Temas omitidos por foco",
+                    classwork_url or CLASSROOM_4A_CLASSWORK_URL,
+                    "ok",
+                    [
+                        f"Filtro activo {CLASSROOM_TOPIC_INCLUDE_ENV}.",
+                        "Temas omitidos en esta corrida rapida: " + " | ".join(omitted_labels[:12]),
+                    ],
+                )
+            )
         for index, label in enumerate(topic_labels[:MAX_CLASSROOM_TOPIC_VIEWS], start=1):
             step_label = f"Classroom: abrir tema {index}/{len(topic_labels)} - {label}"
             step_started = self._progress(step_label)
@@ -3561,15 +4973,17 @@ class BrowserController:
                 step_started,
                 f"abierto={'si' if opened else 'no'} url={current_url or 'sin url'}",
             )
-            if not opened or not self._is_classroom_4a_topic_page(page):
+            if not opened or not (
+                self._is_classroom_4a_topic_page(page) or self._is_classroom_4a_listing_page(page)
+            ):
                 snapshots.append(
                     self._message_snapshot(
                         f"Google Classroom - 4-A - Trabajo de clase - Tema: {label[:70]}",
                         current_url,
-                        "error",
+                        "empty",
                         [
                             f"No pude abrir este tema desde Filtro por tema: {label}.",
-                            "No se leyo la vista actual porque no corresponde a una URL real de tema 4-A.",
+                            "Se omite este tema puntual para no bloquear la generacion completa; la vista general de Classroom ya fue validada.",
                         ],
                     )
                 )
@@ -3579,10 +4993,16 @@ class BrowserController:
                 except Exception:
                     pass
                 continue
+            snapshot_notes = [f"Tema/asignatura seleccionado desde Filtro por tema: {label}."]
+            if not self._is_classroom_4a_topic_page(page):
+                snapshot_notes.append(
+                    "Classroom mantuvo la URL general de Trabajo de clase despues de aplicar el filtro; "
+                    "se leyo la vista visible filtrada."
+                )
             snapshot = self._snapshot_classroom_page(
                 page,
                 f"Google Classroom - 4-A - Trabajo de clase - Tema: {label[:70]}",
-                [f"Tema/asignatura seleccionado desde Filtro por tema: {label}."],
+                snapshot_notes,
             )
             snapshots.append(snapshot)
         if classwork_url:
@@ -3600,6 +5020,19 @@ class BrowserController:
         classwork_url: str,
     ) -> list[PageSnapshot]:
         snapshots: list[PageSnapshot] = []
+        topic_links, omitted_labels = self._filtered_classroom_topic_links(topic_links)
+        if omitted_labels:
+            snapshots.append(
+                self._message_snapshot(
+                    "Google Classroom - 4-A - Trabajo en clase - Temas omitidos por foco",
+                    classwork_url or CLASSROOM_4A_CLASSWORK_URL,
+                    "ok",
+                    [
+                        f"Filtro activo {CLASSROOM_TOPIC_INCLUDE_ENV}.",
+                        "Temas omitidos en esta corrida rapida: " + " | ".join(omitted_labels[:12]),
+                    ],
+                )
+            )
         for index, topic in enumerate(topic_links[:MAX_CLASSROOM_TOPIC_VIEWS], start=1):
             label = clean_text(str(topic.get("label") or "Tema Classroom")).replace("\n", " ")
             url = str(topic.get("url") or "").strip()
@@ -3715,6 +5148,10 @@ class BrowserController:
             stats["classroom_detail_incomplete_details"] = classroom_detail_stats.get("incomplete_details", 0)
             stats["classroom_detail_candidate_titles"] = classroom_detail_stats.get("candidate_titles", [])
             stats["classroom_detail_candidate_hrefs"] = classroom_detail_stats.get("candidate_detail_hrefs", [])
+            stats["classroom_attachments_seen"] = classroom_detail_stats.get("attachments_seen", 0)
+            stats["classroom_attachment_attempts"] = classroom_detail_stats.get("attachment_attempts", 0)
+            stats["classroom_attachment_texts"] = classroom_detail_stats.get("attachment_texts", 0)
+            stats["classroom_attachment_posts_opened"] = classroom_detail_stats.get("attachment_posts_opened", 0)
 
         if classroom_detail_text:
             text = "\n\n".join(
@@ -3726,7 +5163,7 @@ class BrowserController:
             ).strip()
             notes.append("Inclui detalles de posts relevantes de este tema/asignatura.")
 
-        if platform.startswith("Google Classroom"):
+        if platform.startswith("Google Classroom") and not classroom_detail_stats.get("attachment_attempts", 0):
             attachment_text, attachment_stats = self._extract_classroom_attachment_text(
                 page,
                 allowed_hrefs=classroom_attachment_hrefs,
@@ -3734,6 +5171,8 @@ class BrowserController:
             if attachment_text:
                 text = "\n\n".join([text, attachment_text]).strip()
                 stats["classroom_attachments_seen"] = attachment_stats.get("seen", 0)
+                stats["classroom_attachment_attempts"] = attachment_stats.get("attachment_attempts", 0)
+                stats["classroom_attachment_texts"] = attachment_stats.get("attachment_texts", 0)
                 stats["classroom_pdf_attempts"] = attachment_stats.get("pdf_attempts", 0)
                 stats["classroom_pdf_texts"] = attachment_stats.get("pdf_texts", 0)
             elif attachment_stats.get("seen", 0):
@@ -3832,7 +5271,9 @@ class BrowserController:
             clicked = self._click_classroom_topic_option(page, label)
             if clicked:
                 self._wait_after_classroom_interaction(page)
-            return clicked and self._is_classroom_4a_topic_page(page)
+            return bool(clicked) and (
+                self._is_classroom_4a_topic_page(page) or self._is_classroom_4a_listing_page(page)
+            )
         except Exception:
             return False
 
@@ -4042,11 +5483,16 @@ class BrowserController:
                 pages = []
             else:
                 raise
+        try:
+            browser_path = str(self._browser_path())
+        except AppError:
+            browser_path = ""
         return {
             "browser_open": browser_open,
             "started_at": self._browser_started_at,
             "pages": pages,
-            "chrome": str(self._browser_path()) if (CHROME_EXE.exists() or EDGE_EXE.exists()) else "",
+            "chrome": browser_path or "playwright-bundled",
+            "headless": self._headless,
         }
 
     def close(self) -> None:
@@ -4067,7 +5513,7 @@ class BrowserController:
             self._close_on_browser_thread()
 
     def _close_on_browser_thread(self) -> None:
-        if self._context is not None:
+        if self._context is not None and not self._cdp_attached:
             try:
                 self._context.close()
             except Exception:
@@ -4079,6 +5525,7 @@ class BrowserController:
                 pass
         self._context = None
         self._playwright = None
+        self._cdp_attached = False
         self._browser_started_at = None
 
     def _find_page(self, pages: list[Any], needle: str) -> Any | None:
@@ -4091,6 +5538,8 @@ class BrowserController:
     def _snapshot_page(self, page: Any, platform: str) -> PageSnapshot:
         if platform.startswith("Google Classroom"):
             return self._snapshot_classroom_page(page, platform)
+        if platform.startswith("Calendario SSCC"):
+            return self._snapshot_sscc_calendar_page(page)
 
         notes: list[str] = []
         title = ""
@@ -4213,16 +5662,27 @@ class BrowserController:
         if platform == "SchoolNet - Calificaciones":
             structured_grades, structured_stats = self._extract_schoolnet_grades_table(page)
             if structured_grades:
-                text = "\n\n".join(
-                    [
-                        structured_grades,
-                        "TEXTO CRUDO VISIBLE",
-                        text,
-                    ]
-                ).strip()
+                if schoolnet_existing_canonical_p1(structured_grades):
+                    text = structured_grades
+                    notes.append(
+                        "Calificaciones: se omitio el texto crudo para evitar confundir P1/P2 con columnas parciales o NF."
+                    )
+                else:
+                    text = "\n\n".join(
+                        [
+                            structured_grades,
+                            "TEXTO CRUDO VISIBLE",
+                            text,
+                        ]
+                    ).strip()
                 stats["structured_grade_sources"] = structured_stats.get("source_count", 0)
+                stats["structured_assessment_detail_sources"] = structured_stats.get("assessment_detail_sources", 0)
+                if structured_stats.get("omitted_raw_grade_sources"):
+                    stats["omitted_raw_grade_sources"] = structured_stats.get("omitted_raw_grade_sources", 0)
+                if not structured_stats.get("assessment_detail_sources"):
+                    notes.append("No pude abrir o leer el detalle de evaluaciones individuales de SchoolNet.")
             else:
-                notes.append("No pude construir una lectura estructurada de la tabla de calificaciones P1.")
+                notes.append("No pude construir una lectura estructurada de la tabla de calificaciones P1/P2.")
         elif platform == "SchoolNet - Conducta":
             structured_conducta, structured_stats = self._extract_schoolnet_conducta_views(page)
             if structured_stats.get("conducta_view_clicks") is not None:
@@ -4402,6 +5862,10 @@ class BrowserController:
         candidate_detail_hrefs: list[str] = []
         detail_blocks: list[str] = []
         attachment_hrefs: list[str] = []
+        attachment_seen = 0
+        attachment_attempts = 0
+        attachment_texts = 0
+        attachment_posts_opened = 0
         attempted_keys: set[str] = set()
         reused_cache_record_ids: set[str] = set()
         visible_fallback_text = ""
@@ -4431,6 +5895,10 @@ class BrowserController:
                 "candidate_titles": [detect_relevant_classroom_title(detail_text)] if detect_relevant_classroom_title(detail_text) else [],
                 "candidate_detail_hrefs": [],
                 "attachment_hrefs": current_hrefs,
+                "attachments_seen": 0,
+                "attachment_attempts": 0,
+                "attachment_texts": 0,
+                "attachment_posts_opened": 0,
             }
 
         visible_text, visible_stats = self._extract_visible_relevant_classroom_blocks(page, platform, today)
@@ -4595,10 +6063,35 @@ class BrowserController:
                         detail_blocks.append(
                             f"- {link.get('label') or '(sin etiqueta)'} | URL: {link.get('href') or link.get('absolute_href') or '(sin URL)'}"
                         )
+                attachment_text = ""
+                attachment_stats = {"seen": 0, "attachment_attempts": 0, "attachment_texts": 0}
+                if (
+                    attachment_posts_opened < MAX_CLASSROOM_ATTACHMENT_POSTS_PER_SNAPSHOT
+                    and classroom_should_read_attachment_content(selected, card_dom_detail, today)
+                ):
+                    attachment_text, attachment_stats = self._extract_classroom_attachment_text(
+                        page,
+                        known_links=links if isinstance(links, list) else [],
+                        context_label=f"{selected.get('subject', '')} | {selected.get('title', '')}",
+                        context_text=card_dom_detail,
+                    )
+                    if int(attachment_stats.get("attachment_attempts", 0) or 0):
+                        attachment_posts_opened += 1
+                attachment_seen += int(attachment_stats.get("seen", 0) or 0)
+                attachment_attempts += int(attachment_stats.get("attachment_attempts", 0) or 0)
+                attachment_texts += int(attachment_stats.get("attachment_texts", 0) or 0)
+                card_dom_detail_for_cache = card_dom_detail
+                if attachment_text:
+                    detail_blocks.extend(["", attachment_text])
+                    card_dom_detail_for_cache = "\n\n".join([card_dom_detail, attachment_text]).strip()
+                elif classroom_title_needs_complete_detail(str(selected.get("title") or "")):
+                    card_dom_detail_for_cache = "\n\n".join(
+                        [card_dom_detail, "ADJUNTOS VISIBLES CLASSROOM\nNo detectado"]
+                    ).strip()
                 cache_result = self._cache_classroom_detail(
                     selected,
                     platform,
-                    card_dom_detail,
+                    card_dom_detail_for_cache,
                     detail_href,
                     "card_dom",
                 )
@@ -4718,6 +6211,30 @@ class BrowserController:
                 detail_text = visible_detail
             attachment_hrefs.extend(link.get("href", "") for link in detail_links if link.get("href"))
             attachment_hrefs.extend(link.get("absolute_href", "") for link in detail_links if link.get("absolute_href"))
+            attachment_text = ""
+            attachment_stats = {"seen": 0, "attachment_attempts": 0, "attachment_texts": 0}
+            if (
+                attachment_posts_opened < MAX_CLASSROOM_ATTACHMENT_POSTS_PER_SNAPSHOT
+                and classroom_should_read_attachment_content(selected, detail_text, today)
+            ):
+                attachment_text, attachment_stats = self._extract_classroom_attachment_text(
+                    page,
+                    known_links=detail_links,
+                    context_label=f"{selected.get('subject', '')} | {selected.get('title', '')}",
+                    context_text=detail_text,
+                )
+                if int(attachment_stats.get("attachment_attempts", 0) or 0):
+                    attachment_posts_opened += 1
+            attachment_seen += int(attachment_stats.get("seen", 0) or 0)
+            attachment_attempts += int(attachment_stats.get("attachment_attempts", 0) or 0)
+            attachment_texts += int(attachment_stats.get("attachment_texts", 0) or 0)
+            detail_text_for_cache = detail_text
+            if attachment_text:
+                detail_text_for_cache = "\n\n".join([detail_text, attachment_text]).strip()
+            elif classroom_title_needs_complete_detail(str(selected.get("title") or "")):
+                detail_text_for_cache = "\n\n".join(
+                    [detail_text, "ADJUNTOS VISIBLES CLASSROOM\nNo detectado"]
+                ).strip()
 
             opened += 1
             if not detail_text:
@@ -4744,10 +6261,12 @@ class BrowserController:
                     detail_blocks.append(
                         f"- {link.get('label') or '(sin etiqueta)'} | URL: {link.get('href') or link.get('absolute_href') or '(sin URL)'}"
                     )
+            if attachment_text:
+                detail_blocks.extend(["", attachment_text])
             cache_result = self._cache_classroom_detail(
                 selected,
                 platform,
-                detail_text,
+                detail_text_for_cache,
                 detail_href,
                 opened_method,
             )
@@ -4784,6 +6303,10 @@ class BrowserController:
                 "candidate_titles": dedupe(candidate_titles),
                 "candidate_detail_hrefs": dedupe(candidate_detail_hrefs),
                 "attachment_hrefs": [],
+                "attachments_seen": attachment_seen,
+                "attachment_attempts": attachment_attempts,
+                "attachment_texts": attachment_texts,
+                "attachment_posts_opened": attachment_posts_opened,
             }
 
         header = [
@@ -4815,6 +6338,10 @@ class BrowserController:
             "candidate_titles": dedupe(candidate_titles),
             "candidate_detail_hrefs": dedupe(candidate_detail_hrefs),
             "attachment_hrefs": dedupe(attachment_hrefs),
+            "attachments_seen": attachment_seen,
+            "attachment_attempts": attachment_attempts,
+            "attachment_texts": attachment_texts,
+            "attachment_posts_opened": attachment_posts_opened,
         }
 
     def _extract_visible_relevant_classroom_blocks(
@@ -5186,6 +6713,17 @@ class BrowserController:
         cached_text = clean_text(str(record.get("raw_text") or ""))
         if not cached_text or len(cached_text) < 80:
             return None
+        links = candidate.get("links", [])
+        if (
+            isinstance(links, list)
+            and links
+            and "CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM" not in cached_text
+            and "No se pudo extraer texto visible del adjunto" not in cached_text
+        ):
+            return None
+        title = clean_text(str(candidate.get("title") or "")).replace("\n", " ")
+        if title and classroom_title_needs_complete_detail(title) and "ADJUNTOS VISIBLES CLASSROOM" not in cached_text:
+            return None
         visible_detail = visible_classroom_candidate_detail(
             {
                 **candidate,
@@ -5410,16 +6948,192 @@ class BrowserController:
             self._click_terms(page, section_terms)
             self._wait_after_interaction(page)
 
+    def _reset_classroom_material_capture(self) -> None:
+        self._classroom_material_records = []
+        self._classroom_material_seen = set()
+        self._classroom_material_subject_counts = {}
+        self._classroom_materials_dir = classroom_materials_dir()
+        self._classroom_material_files_dir = self._classroom_materials_dir / "files"
+        if self._classroom_materials_dir.exists():
+            shutil.rmtree(self._classroom_materials_dir)
+        self._classroom_material_files_dir.mkdir(parents=True, exist_ok=True)
+
+    def _try_download_classroom_material_file(
+        self,
+        href: str,
+        label: str,
+        kind: str,
+        number: int,
+    ) -> dict[str, Any]:
+        if self._context is None or self._classroom_material_files_dir is None:
+            return {"download_status": "no_context"}
+        if not href or CLASSROOM_MATERIAL_MAX_FILE_BYTES <= 0:
+            return {"download_status": "disabled"}
+        try:
+            response = self._context.request.get(href, timeout=8000)
+        except Exception as exc:
+            return {"download_status": "failed", "download_error": single_line(str(exc))[:180]}
+        status = int(getattr(response, "status", 0) or 0)
+        if status < 200 or status >= 300:
+            return {"download_status": f"http_{status}"}
+        headers = getattr(response, "headers", {}) or {}
+        content_type = str(headers.get("content-type") or headers.get("Content-Type") or "").split(";", 1)[0].strip()
+        if content_type == "text/html" and kind not in {"pdf", "word", "presentation", "spreadsheet"}:
+            return {"download_status": "skipped_html_viewer", "content_type": content_type}
+        content_length = str(headers.get("content-length") or headers.get("Content-Length") or "").strip()
+        if content_length.isdigit() and int(content_length) > CLASSROOM_MATERIAL_MAX_FILE_BYTES:
+            return {"download_status": "skipped_too_large", "bytes": int(content_length), "content_type": content_type}
+        try:
+            body = response.body()
+        except Exception as exc:
+            return {"download_status": "failed_body", "download_error": single_line(str(exc))[:180]}
+        if len(body) > CLASSROOM_MATERIAL_MAX_FILE_BYTES:
+            return {"download_status": "skipped_too_large", "bytes": len(body), "content_type": content_type}
+        if not body:
+            return {"download_status": "empty", "content_type": content_type}
+        if body[:200].lstrip().lower().startswith((b"<!doctype html", b"<html")):
+            return {"download_status": "skipped_html_viewer", "bytes": len(body), "content_type": content_type or "text/html"}
+        filename = safe_material_filename(label, href, number, content_type)
+        path = self._classroom_material_files_dir / filename
+        path.write_bytes(body)
+        relative_path = f"materials/files/{filename}"
+        return {
+            "download_status": "saved",
+            "bytes": len(body),
+            "content_type": content_type or mimetypes.guess_type(filename)[0] or "",
+            "local_path": str(path),
+            "relative_path": relative_path,
+            "latest_object": f"latest/{relative_path}",
+            "archive_object": f"archive/{current_report_date().isoformat()}/{relative_path}",
+        }
+
+    def _record_classroom_material(
+        self,
+        candidate: dict[str, Any],
+        context_label: str,
+        context_text: str,
+        extracted_text: str,
+        error_note: str = "",
+    ) -> None:
+        if CLASSROOM_MATERIAL_MAX_RECORDS <= 0:
+            return
+        if len(self._classroom_material_records) >= CLASSROOM_MATERIAL_MAX_RECORDS:
+            return
+        label = single_line(str(candidate.get("label") or "(adjunto sin etiqueta)"))
+        href = str(candidate.get("absolute_href") or candidate.get("href") or "").strip()
+        kind = str(candidate.get("kind") or classroom_attachment_kind(label, href) or "link")
+        reason = classroom_material_selection_reason(label, href, context_label, context_text, current_report_date())
+        if not reason:
+            return
+        subject, post_title = split_classroom_material_context(context_label, context_text)
+        subject_key = normalize(subject or "No detectada")
+        if self._classroom_material_subject_counts.get(subject_key, 0) >= CLASSROOM_MATERIAL_MAX_PER_SUBJECT:
+            return
+        key = normalize(f"{href}|{label}|{context_label}|{post_title}")
+        if not key or key in self._classroom_material_seen:
+            return
+        self._classroom_material_seen.add(key)
+        number = len(self._classroom_material_records) + 1
+        downloaded = self._try_download_classroom_material_file(href, label, kind, number)
+        text = clean_text(extracted_text)[:CLASSROOM_MATERIAL_TEXT_CHARS]
+        record: dict[str, Any] = {
+            "number": number,
+            "id": stable_id("material", href, label, context_label),
+            "subject": subject,
+            "post_title": post_title,
+            "posted": first_sortable_date(context_text) or "No detectada",
+            "file_name": label,
+            "kind": kind,
+            "source_url": href,
+            "selection_reason": reason,
+            "text_status": "texto_extraido" if text else "texto_no_detectado",
+            "extracted_text": text,
+            "error": single_line(error_note)[:220] if error_note else "",
+            **downloaded,
+        }
+        self._classroom_material_records.append(record)
+        self._classroom_material_subject_counts[subject_key] = self._classroom_material_subject_counts.get(subject_key, 0) + 1
+
+    def _finalize_classroom_material_capture(self, snapshots: list[PageSnapshot] | None = None) -> PageSnapshot:
+        records = list(self._classroom_material_records)
+        if snapshots is not None and len(records) < CLASSROOM_MATERIAL_MAX_RECORDS:
+            existing_keys = {
+                normalize(
+                    "|".join(
+                        [
+                            str(record.get("subject") or ""),
+                            str(record.get("post_title") or ""),
+                            str(record.get("file_name") or ""),
+                        ]
+                    )
+                )
+                for record in records
+            }
+            visible_records = classroom_visible_material_records_from_snapshots(
+                snapshots,
+                start_number=len(records) + 1,
+                existing_keys=existing_keys,
+            )
+            records.extend(visible_records[: max(0, CLASSROOM_MATERIAL_MAX_RECORDS - len(records))])
+        materials_dir = self._classroom_materials_dir or classroom_materials_dir()
+        materials_dir.mkdir(parents=True, exist_ok=True)
+        summary = classroom_materials_summary_text(records)
+        index = {
+            "generated_at": current_report_datetime().isoformat(),
+            "report_date": current_report_date().isoformat(),
+            "criteria": {
+                "window_days": CLASSROOM_MATERIAL_WINDOW_DAYS,
+                "max_records": CLASSROOM_MATERIAL_MAX_RECORDS,
+                "max_per_subject": CLASSROOM_MATERIAL_MAX_PER_SUBJECT,
+                "max_file_bytes": CLASSROOM_MATERIAL_MAX_FILE_BYTES,
+                "ocr": False,
+            },
+            "records": records,
+        }
+        (materials_dir / "materials_summary.txt").write_text(summary, encoding="utf-8")
+        (materials_dir / "materials_index.json").write_text(
+            json.dumps(index, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return PageSnapshot(
+            platform="Materiales Classroom recientes",
+            title="Paquete desechable de materiales Classroom",
+            url=str(materials_dir),
+            text=summary,
+            status="ok" if records else "empty",
+            notes=[
+                f"Registros seleccionados: {len(records)}.",
+                f"Directorio generado: {materials_dir}.",
+            ],
+            stats={
+                "materials_records": len(records),
+                "materials_with_text": sum(1 for record in records if record.get("extracted_text")),
+                "materials_files_saved": sum(1 for record in records if record.get("download_status") == "saved"),
+            },
+        )
+
     def _extract_classroom_attachment_text(
         self,
         page: Any,
         allowed_hrefs: set[str] | None = None,
+        known_links: list[dict[str, Any]] | None = None,
+        context_label: str = "",
+        context_text: str = "",
     ) -> tuple[str, dict[str, Any]]:
         if self._context is None:
-            return "", {"seen": 0, "pdf_attempts": 0, "pdf_texts": 0}
+            return "", {"seen": 0, "attachment_attempts": 0, "attachment_texts": 0, "pdf_attempts": 0, "pdf_texts": 0}
 
         candidates: list[dict[str, Any]] = []
         normalized_allowed_hrefs = set(allowed_hrefs) if allowed_hrefs is not None else None
+        base_url = getattr(page, "url", "") or CLASSROOM_URL
+        if known_links:
+            candidates.extend(
+                normalize_classroom_attachment_candidates(
+                    known_links,
+                    base_url,
+                    allowed_hrefs=normalized_allowed_hrefs,
+                )
+            )
         for frame in list(getattr(page, "frames", []) or []):
             try:
                 frame_candidates = frame.evaluate(CLASSROOM_ATTACHMENT_LINKS_SCRIPT)
@@ -5434,60 +7148,74 @@ class BrowserController:
         seen_keys: set[str] = set()
         for candidate in candidates:
             label = clean_text(str(candidate.get("label") or ""))
-            href = str(candidate.get("href") or "").strip()
-            absolute_href = urljoin(getattr(page, "url", "") or CLASSROOM_URL, href) if href else ""
+            href = str(candidate.get("absolute_href") or candidate.get("href") or "").strip()
+            absolute_href = urljoin(base_url, href) if href else ""
             if normalized_allowed_hrefs is not None and href not in normalized_allowed_hrefs and absolute_href not in normalized_allowed_hrefs:
                 continue
-            key = f"{label}|{href}"
+            kind = classroom_attachment_kind(label, absolute_href)
+            key = normalize(f"{label}|{absolute_href}")
             if not label and not href:
                 continue
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            deduped.append({"label": label, "href": href, "is_pdf": bool(candidate.get("is_pdf"))})
+            deduped.append(
+                {
+                    "label": label,
+                    "href": href,
+                    "absolute_href": absolute_href,
+                    "kind": kind,
+                    "is_pdf": bool(candidate.get("is_pdf")) or kind == "pdf",
+                }
+            )
 
         if not deduped:
-            return "", {"seen": 0, "pdf_attempts": 0, "pdf_texts": 0}
+            return "", {"seen": 0, "attachment_attempts": 0, "attachment_texts": 0, "pdf_attempts": 0, "pdf_texts": 0}
 
         blocks: list[str] = [
             "ADJUNTOS VISIBLES CLASSROOM",
         ]
+        if context_label:
+            blocks.append(f"Post relacionado: {single_line(context_label)}")
         for index, candidate in enumerate(deduped[:12], start=1):
             blocks.append(
-                f"{index}. {candidate['label'] or '(sin etiqueta)'} | URL: {candidate['href'] or '(sin URL)'}"
+                f"{index}. {candidate['label'] or '(sin etiqueta)'} | Tipo: {candidate.get('kind') or 'link'} | URL: {candidate['href'] or '(sin URL)'}"
             )
 
-        pdf_candidates = [
+        openable_candidates = [
             candidate
             for candidate in deduped
-            if candidate.get("is_pdf")
-            or ".pdf" in normalize(f"{candidate.get('label', '')} {candidate.get('href', '')}")
-        ][:4]
+            if classroom_attachment_is_openable(str(candidate.get("label") or ""), str(candidate.get("absolute_href") or candidate.get("href") or ""))
+        ][:MAX_CLASSROOM_ATTACHMENTS_TO_OPEN]
 
+        attachment_attempts = 0
+        attachment_texts = 0
         pdf_attempts = 0
         pdf_texts = 0
-        for candidate in pdf_candidates:
-            href = str(candidate.get("href") or "").strip()
-            label = candidate.get("label") or "(PDF sin etiqueta)"
+        for candidate in openable_candidates:
+            href = str(candidate.get("absolute_href") or candidate.get("href") or "").strip()
+            label = candidate.get("label") or "(adjunto sin etiqueta)"
             if not href or href.startswith(("javascript:", "mailto:", "#")):
                 continue
-            pdf_attempts += 1
+            attachment_attempts += 1
+            if bool(candidate.get("is_pdf")):
+                pdf_attempts += 1
             target = None
             extracted_text = ""
             error_note = ""
             try:
                 target = self._context.new_page()
-                target.goto(urljoin(getattr(page, "url", "") or CLASSROOM_URL, href), wait_until="domcontentloaded", timeout=10000)
+                target.goto(href, wait_until="domcontentloaded", timeout=8000)
                 try:
-                    target.wait_for_load_state("networkidle", timeout=4000)
+                    target.wait_for_load_state("networkidle", timeout=2000)
                 except Exception:
                     pass
                 try:
-                    target.wait_for_timeout(800)
+                    target.wait_for_timeout(700)
                 except Exception:
                     pass
-                extracted_text, _ = self._extract_page_text(target)
-                extracted_text = clean_text(extracted_text)[:15000]
+                extracted_text = self._extract_scrollable_classroom_attachment_text(target)
+                extracted_text = compact_classroom_attachment_text(extracted_text, str(label))
             except Exception as exc:
                 error_note = f"No pude abrir o leer el adjunto: {exc}"
             finally:
@@ -5497,28 +7225,79 @@ class BrowserController:
                     except Exception:
                         pass
 
+            self._record_classroom_material(
+                candidate,
+                context_label=context_label,
+                context_text=context_text,
+                extracted_text=extracted_text,
+                error_note=error_note,
+            )
+
             blocks.extend(
                 [
                     "",
-                    f"CONTENIDO EXTRAIDO DEL ADJUNTO PDF: {label}",
+                    f"CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM: {label}",
+                    f"Tipo detectado: {candidate.get('kind') or 'link'}",
+                    f"Post relacionado: {single_line(context_label) if context_label else 'No detectado'}",
                     f"URL: {href}",
                 ]
             )
             if extracted_text:
-                pdf_texts += 1
+                attachment_texts += 1
+                if bool(candidate.get("is_pdf")):
+                    pdf_texts += 1
                 blocks.append(extracted_text)
             else:
-                blocks.append(error_note or "No se pudo extraer texto visible del PDF con el visor del navegador.")
+                blocks.append(error_note or "No se pudo extraer texto visible del adjunto con el visor del navegador.")
 
         return "\n".join(blocks).strip(), {
             "seen": len(deduped),
+            "attachment_attempts": attachment_attempts,
+            "attachment_texts": attachment_texts,
             "pdf_attempts": pdf_attempts,
             "pdf_texts": pdf_texts,
         }
 
-    def _extract_schoolnet_grades_table(self, page: Any) -> tuple[str, dict[str, Any]]:
+    def _extract_scrollable_classroom_attachment_text(self, page: Any) -> str:
         parts: list[str] = []
+        for _index in range(4):
+            try:
+                text, _stats = self._extract_page_text(page)
+            except Exception:
+                text = ""
+            if text:
+                parts.append(text)
+            moved = 0
+            try:
+                moved = int(
+                    page.evaluate(
+                        """
+() => {
+  const before = window.scrollY || document.documentElement.scrollTop || 0;
+  window.scrollBy(0, Math.max(600, Math.floor(window.innerHeight * 0.85)));
+  const after = window.scrollY || document.documentElement.scrollTop || 0;
+  return Math.abs(after - before);
+}
+"""
+                    )
+                    or 0
+                )
+            except Exception:
+                moved = 0
+            if not moved:
+                break
+            try:
+                page.wait_for_timeout(450)
+            except Exception:
+                time.sleep(0.45)
+        return merge_text_parts(parts)
+
+    def _extract_schoolnet_grades_table(self, page: Any) -> tuple[str, dict[str, Any]]:
+        canonical_parts: list[str] = []
+        fallback_parts: list[str] = []
+        diagnostic_parts: list[str] = []
         sources: list[dict[str, Any]] = []
+        canonical_sources: list[dict[str, Any]] = []
         frames = list(getattr(page, "frames", []) or [])
 
         for index, frame in enumerate(frames):
@@ -5532,15 +7311,15 @@ class BrowserController:
 
             canonical_p1_text = schoolnet_canonical_p1_from_detail(detail_text)
             if canonical_p1_text:
-                parts.append(canonical_p1_text)
-                sources.append(
-                    {
-                        "source": frame_label,
-                        "kind": "canonical_grades_p1",
-                        "chars": len(canonical_p1_text),
-                        "url": frame_url[:180],
-                    }
-                )
+                canonical_parts.append(canonical_p1_text)
+                canonical_source = {
+                    "source": frame_label,
+                "kind": "canonical_grades_p1_p2",
+                    "chars": len(canonical_p1_text),
+                    "url": frame_url[:180],
+                }
+                canonical_sources.append(canonical_source)
+                sources.append(canonical_source)
             else:
                 try:
                     table_text = frame.evaluate(SCHOOLNET_GRADES_TABLE_SCRIPT)
@@ -5549,7 +7328,7 @@ class BrowserController:
                     table_text = ""
 
                 if table_text:
-                    parts.append(table_text)
+                    fallback_parts.append(table_text)
                     sources.append(
                         {
                             "source": frame_label,
@@ -5560,7 +7339,7 @@ class BrowserController:
                     )
 
             if detail_text:
-                parts.append(detail_text)
+                diagnostic_parts.append(detail_text)
                 sources.append(
                     {
                         "source": frame_label,
@@ -5577,7 +7356,7 @@ class BrowserController:
                 subject_detail_text = ""
 
             if subject_detail_text:
-                parts.append(subject_detail_text)
+                diagnostic_parts.append(subject_detail_text)
                 sources.append(
                     {
                         "source": frame_label,
@@ -5587,7 +7366,29 @@ class BrowserController:
                     }
                 )
 
-        return "\n\n".join(dedupe(parts)), {"source_count": len(sources), "sources": sources[:8]}
+        if canonical_parts:
+            assessment_details = dedupe(
+                [
+                    part
+                    for part in diagnostic_parts
+                    if part.startswith("DETALLE POR ASIGNATURA SCHOOLNET CALIFICACIONES")
+                ]
+            )
+            return "\n\n".join(dedupe(canonical_parts + assessment_details)), {
+                "source_count": len(canonical_sources),
+                "sources": canonical_sources[:8],
+                "omitted_raw_grade_sources": max(0, len(sources) - len(canonical_sources)),
+                "assessment_detail_sources": len(assessment_details),
+            }
+
+        return "\n\n".join(dedupe(fallback_parts + diagnostic_parts)), {
+            "source_count": len(sources),
+            "sources": sources[:8],
+            "assessment_detail_sources": sum(
+                part.startswith("DETALLE POR ASIGNATURA SCHOOLNET CALIFICACIONES")
+                for part in diagnostic_parts
+            ),
+        }
 
     def _expand_schoolnet_grade_rows(self, page: Any) -> int:
         clicked = 0
@@ -5733,6 +7534,8 @@ def classify_platform(url: str) -> str | None:
         return "SchoolNet"
     if "classroom.google" in lower or "classroom.google.com" in lower:
         return "Google Classroom"
+    if "ssccmanquehue.cl/calendario-segundo-ciclo" in lower or "calendar.google" in lower:
+        return "Calendario SSCC Segundo Ciclo - 4A"
     return None
 
 
@@ -5772,8 +7575,6 @@ def login_status_note(platform: str, url: str, text: str) -> str | None:
     if platform.startswith("Google Classroom"):
         if "accounts.google.com" in lower_url:
             return "Google Classroom redirigio a login de Google. Inicia sesion y vuelve a generar."
-        if "sign in" in lower_text or "iniciar sesion" in lower_text or "iniciar sesión" in lower_text:
-            return "Google Classroom parece requerir inicio de sesion."
     return None
 
 
@@ -5864,6 +7665,9 @@ CLASSROOM_STUDY_KEYWORDS.extend(
         "guia",
         "guA-a",
         "material",
+        "sistema locomotor",
+        "ciencias naturales",
+        "cnat",
         "repasar",
         "test",
         "practice",
@@ -5906,6 +7710,9 @@ CLASSROOM_STREAM_POST_KEYWORDS.extend(
         "homework",
         "worksheet",
         "study",
+        "sistema locomotor",
+        "ciencias naturales",
+        "cnat",
         "vocabulary",
         "vocabulario",
         "wordwall",
@@ -5932,6 +7739,9 @@ CLASSROOM_POST_TITLE_KEYWORDS = [
     "guia de estudio",
     "guA-a de estudio",
     "hoja de ruta",
+    "sistema locomotor",
+    "ciencias naturales",
+    "cnat",
 ]
 SUBJECT_TERMS = [
     "matematica",
@@ -6084,6 +7894,194 @@ def should_skip_past_classroom_item(date_mentions: list[dict[str, Any]], today: 
     return bool(concrete_dates) and max(concrete_dates) < today and not has_recent_relative_marker
 
 
+def classroom_line_is_publication_metadata(line: str) -> bool:
+    normalized_line = normalize(line)
+    if not any(marker in normalized_line for marker in ("publicado", "posted", "published")):
+        return False
+    event_markers = (
+        "fecha limite",
+        "due",
+        "vence",
+        "entrega",
+        "prueba",
+        "evaluacion",
+        "control",
+        "test",
+        "quiz",
+        "examen",
+    )
+    return not any(marker in normalized_line for marker in event_markers)
+
+
+def classroom_event_date_mentions(text: str, base_date: dt.date | None = None) -> list[dict[str, Any]]:
+    lines = clean_text(text).splitlines()
+    output: list[dict[str, Any]] = []
+    for mention in extract_date_mentions(text, base_date):
+        raw = normalize(str(mention.get("raw") or ""))
+        matching_lines = [line for line in lines if raw and raw in normalize(line)]
+        if matching_lines and all(classroom_line_is_publication_metadata(line) for line in matching_lines):
+            continue
+        output.append(mention)
+    return output
+
+
+def sscc_calendar_has_4a(text: str) -> bool:
+    normalized = normalize(text)
+    return bool(re.search(r"(^|[^0-9a-z])4\s*(?:-|°|º)?\s*a([^0-9a-z]|$)", normalized))
+
+
+def unfold_ical_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        if raw.startswith((" ", "\t")) and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw.rstrip("\r"))
+    return lines
+
+
+def unescape_ical_value(value: str) -> str:
+    return (
+        value.replace("\\n", " ")
+        .replace("\\N", " ")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
+    )
+
+
+def parse_ical_date(value: str) -> dt.date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if "T" in raw:
+        raw = raw.split("T", 1)[0]
+    try:
+        return dt.datetime.strptime(raw[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def parse_ical_events(text: str) -> list[dict[str, list[str]]]:
+    events: list[dict[str, list[str]]] = []
+    event: dict[str, list[str]] | None = None
+    for line in unfold_ical_lines(text):
+        if line == "BEGIN:VEVENT":
+            event = {}
+            continue
+        if line == "END:VEVENT":
+            if event is not None:
+                events.append(event)
+            event = None
+            continue
+        if event is None:
+            continue
+        name, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = name.split(";", 1)[0].upper()
+        if key in {"SUMMARY", "DESCRIPTION", "LOCATION", "DTSTART", "DTEND"}:
+            event.setdefault(key, []).append(unescape_ical_value(value))
+    return events
+
+
+def fetch_sscc_calendar_ics_4a_events() -> tuple[list[dict[str, str]], dict[str, Any]]:
+    today = current_report_date()
+    window_end = add_calendar_months(today, SSCC_CALENDAR_LOOKAHEAD_MONTHS)
+    request = Request(
+        SSCC_CALENDAR_4A_ICS_URL,
+        headers={"User-Agent": "resumen-escolar/1.0"},
+    )
+    with urlopen(request, timeout=30) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+        content_type = response.headers.get("Content-Type", "")
+
+    parsed_events = parse_ical_events(raw)
+    filtered: list[dict[str, str]] = []
+    excluded = {"past": 0, "future": 0, "unknown_date": 0, "not_4a": 0}
+    for item in parsed_events:
+        event_date = parse_ical_date((item.get("DTSTART") or [""])[0])
+        summary = clean_text(" ".join(item.get("SUMMARY") or []))
+        description = clean_text(" ".join(item.get("DESCRIPTION") or []))
+        location = clean_text(" ".join(item.get("LOCATION") or []))
+        searchable = " | ".join(part for part in [summary, description, location] if part)
+        if not event_date:
+            excluded["unknown_date"] += 1
+            continue
+        if event_date < today:
+            excluded["past"] += 1
+            continue
+        if event_date > window_end:
+            excluded["future"] += 1
+            continue
+        if not sscc_calendar_has_4a(searchable):
+            excluded["not_4a"] += 1
+            continue
+        details = [f"Fecha: {event_date.isoformat()}", summary]
+        if description and description != summary:
+            details.append(description)
+        if location:
+            details.append(f"Lugar: {location}")
+        filtered.append(
+            {
+                "source": "iCal SSCC Evaluaciones 4A",
+                "url": SSCC_CALENDAR_4A_ICS_URL,
+                "text": " | ".join(part for part in details if part),
+                "dates": event_date.isoformat(),
+            }
+        )
+
+    filtered.sort(key=lambda event: (event.get("dates", ""), normalize(event.get("text", ""))))
+    return filtered[:MAX_SSCC_CALENDAR_EVENTS], {
+        "frames_seen": 0,
+        "frame_errors": 0,
+        "source_count": 1,
+        "calendar_source": "ical",
+        "calendar_ics_url": SSCC_CALENDAR_4A_ICS_URL,
+        "calendar_ics_bytes": len(raw.encode("utf-8")),
+        "calendar_ics_content_type": content_type,
+        "calendar_events_total": len(parsed_events),
+        "calendar_events_4a_raw": len(filtered),
+        "calendar_events_4a": len(filtered),
+        "calendar_window_start": today.isoformat(),
+        "calendar_window_end": window_end.isoformat(),
+        "calendar_filtered_past": excluded.get("past", 0),
+        "calendar_filtered_future": excluded.get("future", 0),
+        "calendar_filtered_unknown_date": excluded.get("unknown_date", 0),
+        "calendar_filtered_not_4a": excluded.get("not_4a", 0),
+        "calendar_filtered_outside_window": 0,
+        "agenda_urls_checked": 0,
+        "sources": [
+            {
+                "source": "iCal SSCC Evaluaciones 4A",
+                "kind": "calendar_4a_events",
+                "events": len(filtered),
+                "url": SSCC_CALENDAR_4A_ICS_URL,
+            }
+        ],
+    }
+
+
+def sscc_calendar_event_in_window(
+    text: str, today: dt.date, window_end: dt.date
+) -> tuple[bool, str, list[dict[str, Any]]]:
+    mentions = extract_date_mentions(text, today)
+    dates = [
+        mention["date"]
+        for mention in mentions
+        if isinstance(mention.get("date"), dt.date)
+    ]
+    if not dates:
+        return False, "unknown_date", mentions
+    if any(today <= parsed <= window_end for parsed in dates):
+        return True, "ok", mentions
+    if max(dates) < today:
+        return False, "past", mentions
+    if min(dates) > window_end:
+        return False, "future", mentions
+    return False, "outside_window", mentions
+
+
 def format_date_mentions(date_mentions: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for mention in date_mentions:
@@ -6190,7 +8188,7 @@ def classroom_candidate_skip_reason(candidate: dict[str, Any], today: dt.date) -
     if posted_date and posted_date < today - dt.timedelta(days=MAX_CLASSROOM_POST_AGE_DAYS):
         return "old"
 
-    content_dates = extract_date_mentions("\n".join([title, preview]), today)
+    content_dates = classroom_event_date_mentions("\n".join([title, preview]), today)
     if should_skip_past_classroom_item(content_dates, today):
         return "past"
     return None
@@ -6684,13 +8682,428 @@ def bulletize(lines: list[str], empty_message: str) -> str:
     return "\n".join(f"- {line}" for line in lines)
 
 
+def first_canonical_p1_block(snapshots: list[PageSnapshot]) -> str:
+    for snapshot in snapshots:
+        if "SchoolNet - Calificaciones" not in snapshot.platform:
+            continue
+        canonical = schoolnet_prefer_canonical_p1(snapshot.text)
+        if schoolnet_existing_canonical_p1(canonical):
+            return canonical
+    return ""
+
+
+def conducta_summary_block(snapshots: list[PageSnapshot]) -> str:
+    conducta_texts = [
+        snapshot.text
+        for snapshot in snapshots
+        if "SchoolNet - Conducta" in snapshot.platform and snapshot.text
+    ]
+    if not conducta_texts:
+        return ""
+
+    counts: dict[str, int] | None = None
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for text in conducta_texts:
+        if counts is None:
+            counts = parse_conducta_counts(text)
+        for record in parse_conducta_records(text, "SchoolNet - Conducta"):
+            record_id = str(record.get("id") or stable_hash(record.get("raw_text", "")))
+            if record_id in seen:
+                continue
+            seen.add(record_id)
+            records.append(record)
+
+    records.sort(key=lambda record: str((record.get("metadata") or {}).get("sort_date") or ""), reverse=True)
+    latest = format_conducta_record_for_prompt(records[0]) if records else "No detectado"
+    count_line = (
+        f"Positivas: {counts['positivas']} | Negativas: {counts['negativas']} | Neutras: {counts['neutras']}"
+        if counts
+        else "Positivas: No detectado | Negativas: No detectado | Neutras: No detectado"
+    )
+    return "\n".join(
+        [
+            "RESUMEN CANONICO SCHOOLNET CONDUCTA",
+            "Fuente autoritativa para la infografia: SchoolNet - Conducta.",
+            f"Totales de anotaciones: {count_line}",
+            f"Ultima anotacion: {latest}",
+        ]
+    )
+
+
+def authorized_event_lines(
+    snapshots: list[PageSnapshot],
+    cutoff_date: dt.date,
+    window_end: dt.date,
+) -> list[str]:
+    events: list[tuple[dt.date, str]] = []
+    seen: set[str] = set()
+    calendar_dates: set[dt.date] = set()
+    event_re = re.compile(r"^Evento\s+\d+\s+\|\s+(.+)$")
+    for snapshot in snapshots:
+        if snapshot.platform.startswith("Calendario SSCC"):
+            for line in snapshot.text.splitlines():
+                match = event_re.match(line.strip())
+                if not match:
+                    continue
+                event_text = match.group(1).strip()
+                event_date = iso_date_in_text(event_text) or latest_date(extract_date_mentions(event_text, cutoff_date))
+                if not event_date or event_date < cutoff_date or event_date > window_end:
+                    continue
+                key = normalize(event_text)
+                if key and key not in seen:
+                    seen.add(key)
+                    calendar_dates.add(event_date)
+                    events.append((event_date, event_text))
+        elif snapshot.platform.startswith("Google Classroom"):
+            for item in parse_classroom_study_items(snapshot.text):
+                item_type = str(item.get("type") or "Actividad")
+                if item_type not in {"Prueba/evaluacion", "Tarea/entrega"}:
+                    continue
+                item_text = clean_text(str(item.get("text") or ""))
+                if classroom_text_is_non_event_noise(item_text):
+                    continue
+                dates = [
+                    mention["date"]
+                    for mention in extract_date_mentions(item_text, cutoff_date)
+                    if mention.get("kind") == "concrete" and isinstance(mention.get("date"), dt.date)
+                ]
+                valid_dates = sorted(date for date in dates if cutoff_date <= date <= window_end)
+                if not valid_dates:
+                    continue
+                event_date = valid_dates[0]
+                event_text = (
+                    f"Google Classroom | Fecha: {event_date.isoformat()} | "
+                    f"Tipo: {item_type} | "
+                    f"Asignatura: {item.get('subject', 'No detectada')} | "
+                    f"Tema/texto: {single_line(item_text)}"
+                )
+                if event_date in calendar_dates:
+                    # Mantener una sola actividad: el calendario aporta la fecha
+                    # oficial y Classroom agrega el detalle util de la tarea.
+                    for index, (existing_date, existing_text) in enumerate(events):
+                        if existing_date == event_date:
+                            events[index] = (existing_date, f"{existing_text} | Classroom: {single_line(item_text)}")
+                            break
+                    continue
+                key = normalize(event_text)
+                if key and key not in seen:
+                    seen.add(key)
+                    events.append((event_date, event_text))
+
+    events.sort(key=lambda item: (item[0], normalize(item[1])))
+    return [text for _, text in events]
+
+
+def classroom_text_is_non_event_noise(text: str) -> bool:
+    normalized_text = normalize(text)
+    noise_markers = [
+        "se eliminara definitivamente",
+        "todos los profesores de la clase pueden ver este material",
+        "comentario publicado",
+        "anade un comentario",
+        "publicar",
+    ]
+    if any(marker in normalized_text for marker in noise_markers):
+        actionable_markers = [
+            "prueba",
+            "evaluacion",
+            "control",
+            "tarea",
+            "entrega",
+            "trabajo evaluado",
+        ]
+        if not any(marker in normalized_text for marker in actionable_markers):
+            return True
+    return False
+
+
+def classroom_material_priority_terms(event_lines: list[str]) -> list[str]:
+    normalized_events = "\n".join(normalize(line) for line in event_lines)
+    terms: list[str] = []
+    phrase_candidates = [
+        "sistema locomotor",
+        "ciencias naturales",
+        "cnat",
+        "huesos",
+        "musculos",
+        "articulaciones",
+        "matematica",
+        "lenguaje",
+        "religion",
+        "historia",
+        "ingles",
+    ]
+    for phrase in phrase_candidates:
+        if phrase in normalized_events:
+            terms.append(phrase)
+
+    stopwords = {
+        "google",
+        "classroom",
+        "calendario",
+        "evento",
+        "fecha",
+        "tipo",
+        "tema",
+        "texto",
+        "prueba",
+        "evaluacion",
+        "tarea",
+        "entrega",
+        "autorizada",
+        "google",
+        "classroom",
+    }
+    for line in event_lines:
+        normalized_line = normalize(line)
+        if not any(marker in normalized_line for marker in ("prueba", "evaluacion", "control", "evadoc", "tarea")):
+            continue
+        for token in re.split(r"[^a-z0-9]+", normalized_line):
+            if len(token) < 4 or token in stopwords or re.fullmatch(r"\d+", token):
+                continue
+            terms.append(token)
+
+    seen: set[str] = set()
+    output: list[str] = []
+    for term in terms:
+        normalized = normalize(term)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            output.append(normalized)
+    return output
+
+
+def classroom_material_block_score(block: str, priority_terms: list[str]) -> int:
+    normalized_block = normalize(block)
+    score = 0
+    for term in priority_terms:
+        if not term or term not in normalized_block:
+            continue
+        score += 80 if " " in term else 20
+    if any(marker in normalized_block for marker in ("prueba", "evaluacion", "control", "temario", "guia de estudio")):
+        score += 25
+    if any(marker in normalized_block for marker in ("sistema locomotor", "ciencias naturales", "cnat")):
+        score += 40
+    if any(marker in normalized_block for marker in ("youtube", "youtu.be", "video")):
+        score -= 15
+    return score
+
+
+def authorized_classroom_material_blocks(
+    snapshots: list[PageSnapshot],
+    event_lines: list[str] | None = None,
+    limit: int = 6,
+) -> list[str]:
+    blocks: list[tuple[int, int, str]] = []
+    pending: list[str] = []
+    seen: set[str] = set()
+    priority_terms = classroom_material_priority_terms(event_lines or [])
+    max_candidates = max(limit * 4, limit)
+    order = 0
+    stop_prefixes = (
+        "CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:",
+        "POST ABIERTO ",
+        "POST CAPTURADO ",
+        "POST VISIBLE ",
+        "POST REUTILIZADO ",
+        "TEXTO CRUDO ",
+        "----- ",
+    )
+
+    def add_block(block: str, sequence: int, min_score: int = -999) -> bool:
+        clean_block = clean_text(block).strip()
+        if not clean_block:
+            return False
+        normalized_block = normalize(clean_block)
+        if not normalized_block or normalized_block in seen:
+            return False
+        score = classroom_material_block_score(clean_block, priority_terms)
+        if score < min_score:
+            return False
+        seen.add(normalized_block)
+        blocks.append((score, sequence, clean_block[:2200]))
+        return True
+
+    for snapshot in snapshots:
+        if not snapshot.platform.startswith("Google Classroom"):
+            continue
+        lines = clean_text(snapshot.text).splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index].strip()
+            if not line.startswith("CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:"):
+                index += 1
+                continue
+            capture = [line]
+            cursor = index + 1
+            while cursor < len(lines) and len(capture) < 28:
+                current = lines[cursor].strip()
+                if current and any(current.startswith(prefix) for prefix in stop_prefixes):
+                    break
+                if current:
+                    capture.append(current)
+                cursor += 1
+            block = "\n".join(capture).strip()
+            label = single_line(line.replace("CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:", "").strip())
+            normalized_block = normalize(block)
+            is_generic_block = classroom_attachment_extracted_block_is_generic(block)
+            if (
+                "no se pudo extraer texto visible del adjunto" in normalized_block
+                or "no pude abrir o leer el adjunto" in normalized_block
+                or is_generic_block
+            ):
+                if label and not is_generic_block:
+                    pending.append(label)
+                index = cursor
+                continue
+            if add_block(block, order):
+                order += 1
+                if len(blocks) >= max_candidates:
+                    break
+            index = cursor
+        if len(blocks) >= max_candidates:
+            break
+
+    if len(blocks) < max_candidates and priority_terms:
+        post_prefixes = (
+            "POST ABIERTO ",
+            "POST CAPTURADO ",
+            "POST VISIBLE ",
+            "POST REUTILIZADO ",
+        )
+        for snapshot in snapshots:
+            if not snapshot.platform.startswith("Google Classroom"):
+                continue
+            lines = clean_text(snapshot.text).splitlines()
+            index = 0
+            while index < len(lines):
+                line = lines[index].strip()
+                if not line.startswith(post_prefixes):
+                    index += 1
+                    continue
+                capture = [line]
+                cursor = index + 1
+                while cursor < len(lines) and len(capture) < 26:
+                    current = lines[cursor].strip()
+                    if current and any(current.startswith(prefix) for prefix in stop_prefixes):
+                        break
+                    if current:
+                        capture.append(current)
+                    cursor += 1
+                block = "\n".join(capture).strip()
+                visible_block = "MATERIAL VISIBLE DE CLASSROOM RELACIONADO CON EVENTOS FUTUROS\n" + block
+                if add_block(visible_block, order, min_score=20):
+                    order += 1
+                    if len(blocks) >= max_candidates:
+                        break
+                index = cursor
+            if len(blocks) >= max_candidates:
+                break
+    if blocks:
+        blocks.sort(key=lambda item: (-item[0], item[1]))
+        return [block for _, _, block in blocks[:limit]]
+    return [f"Pendiente de lectura: {item}" for item in dedupe(pending)[:6]]
+
+
+def authorized_recent_classroom_materials(snapshots: list[PageSnapshot]) -> str:
+    for snapshot in snapshots:
+        if snapshot.platform.startswith("Materiales Classroom recientes"):
+            text = clean_text(snapshot.text)
+            if text and "No detectado" not in text:
+                return text
+    return ""
+
+
+def iso_date_in_text(text: str) -> dt.date | None:
+    match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text or "")
+    if not match:
+        return None
+    try:
+        return dt.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def authorized_infographic_data(
+    snapshots: list[PageSnapshot],
+    report_date: str,
+    cutoff_date: str,
+    calendar_window_end: str,
+) -> str:
+    sections = [
+        "DATOS AUTORIZADOS PARA LA INFOGRAFIA",
+        "Regla: la imagen final debe usar solamente los datos de esta seccion. La evidencia cruda posterior es respaldo tecnico, no una fuente para agregar secciones ni datos nuevos.",
+        "Titulo visible: REPORTE ESCOLAR DE GABITO",
+        f"Fecha visible: {report_date}",
+        "Estudiante visible: Gabito",
+        "Curso visible: 4 BASICO A",
+        "No usar otro nombre, curso, letra, asistencia, logo, promedio, conducta o dato si no aparece explicitamente aqui.",
+        "",
+    ]
+
+    grades = first_canonical_p1_block(snapshots)
+    sections.append(grades or "CALIFICACIONES P1/P2 CANONICAS SCHOOLNET\nNo detectado")
+    sections.append("")
+
+    conducta = conducta_summary_block(snapshots)
+    sections.append(conducta or "RESUMEN CANONICO SCHOOLNET CONDUCTA\nNo detectado")
+    sections.append("")
+
+    events = authorized_event_lines(
+        snapshots,
+        dt.date.fromisoformat(cutoff_date),
+        dt.date.fromisoformat(calendar_window_end),
+    )
+    sections.extend(
+        [
+            "PROXIMAS TAREAS Y EVALUACIONES AUTORIZADAS",
+            f"Ventana autorizada: {cutoff_date}..{calendar_window_end}.",
+            "Regla: mostrar una sola seccion de proximos eventos, ordenada por fecha ascendente. El Calendario SSCC es la fuente principal de fechas; Classroom solo agrega tareas/pruebas futuras no cubiertas por el calendario o material relacionado. Excluir completamente fechas anteriores a la fecha visible.",
+        ]
+    )
+    if events:
+        sections.extend(events)
+    else:
+        sections.append("No detectado")
+
+    sections.extend(
+        [
+            "",
+            "MATERIALES CLASSROOM RECIENTES",
+            "Regla: esta es la fuente preferida para responder preguntas como 'que debo estudiar'. Citar asignatura, post/archivo y fecha visible. Si un material no tiene texto extraido, no inventar su contenido.",
+        ]
+    )
+    recent_materials = authorized_recent_classroom_materials(snapshots)
+    if recent_materials:
+        sections.append(recent_materials)
+    else:
+        sections.append("No detectado")
+
+    sections.extend(
+        [
+            "",
+            "MATERIAL DE ESTUDIO EXTRAIDO DE CLASSROOM",
+            "Regla: usar solo estos bloques para responder preguntas sobre contenido de guias, PDFs o archivos leidos desde Classroom. Si un adjunto aparece como pendiente, no inventar su contenido.",
+        ]
+    )
+    material_blocks = authorized_classroom_material_blocks(snapshots, events)
+    if material_blocks:
+        sections.extend(material_blocks)
+    else:
+        sections.append("No detectado")
+    return "\n".join(sections).strip()
+
+
 def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str = "") -> str:
-    today = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    today = current_report_datetime().strftime("%Y-%m-%d %H:%M")
     reference_date = current_report_date()
     report_date = reference_date.isoformat()
     cutoff_date = reference_date.isoformat()
+    calendar_window_end = add_calendar_months(reference_date, SSCC_CALENDAR_LOOKAHEAD_MONTHS).isoformat()
     cutoff_year = reference_date.year
     chat_title = f"Resumen Escolar - {STUDENT_NAME} - {report_date}"
+    authorized_data = authorized_infographic_data(snapshots, report_date, cutoff_date, calendar_window_end)
     evidence_blocks: list[str] = []
 
     for snapshot in snapshots:
@@ -6712,22 +9125,38 @@ def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str
         )
 
     if not evidence_blocks:
-        evidence_blocks.append("No habia pestanas de SchoolNet/Classroom disponibles al generar este prompt.")
+        evidence_blocks.append("No habia pestanas de SchoolNet/Classroom/Calendario SSCC disponibles al generar este prompt.")
 
     prompt = [
         f"TITULO SUGERIDO DEL CHAT: {chat_title}",
         "Usa este titulo para nombrar la conversacion si la interfaz de ChatGPT lo permite, de modo que el historial sea buscable por fecha. No agregues texto fuera de la imagen.",
         "",
-        f"Actua como asistente escolar y disenador de infografias educativas. El estudiante se llama {STUDENT_NAME}. Usa SOLO la evidencia copiada abajo.",
+        "Actua como asistente escolar y disenador de infografias educativas. Usa SOLO los datos autorizados copiados abajo.",
         "",
         "No inventes datos. Si falta informacion, escribe exactamente \"No detectado\". Usa PENDIENTES / DUDAS solo para listar informacion incompleta o contradicciones, pero no rellenes datos ausentes.",
-        "La fuente principal es la EVIDENCIA CRUDA copiada al final del prompt. Prioriza esa evidencia por sobre inferencias, expectativas escolares o conocimiento general.",
+        "La fuente principal para dibujar la imagen es DATOS AUTORIZADOS PARA LA INFOGRAFIA. La EVIDENCIA CRUDA del final es respaldo tecnico y solo sirve para resolver dudas sin agregar datos nuevos.",
+        "",
+        "CONTROL DURO CONTRA INVENCIONES",
+        "- No dibujes ni inventes logo, escudo, insignia, lema ni nombre largo del colegio.",
+        "- No muestres asistencia, asistencia semanal, porcentaje de asistencia, comportamiento, responsabilidad, fortalezas, tips, colacion saludable, botella de agua, mensajes genericos ni habitos si no aparecen literalmente en DATOS AUTORIZADOS PARA LA INFOGRAFIA.",
+        "- No uses datos de ejemplos anteriores, plantillas escolares, conocimiento general ni suposiciones.",
+        "- No cambies el curso: debe decir exactamente 4 BASICO A. Nunca 4 BASICO C.",
+        "- No cambies el estudiante visible: debe decir Gabito.",
+        "- No agregues asignaturas, notas, eventos, tareas ni observaciones que no esten autorizadas.",
         "",
         "IMPORTANTE SOBRE ADJUNTOS: usa el contenido de adjuntos solo si aparece textual en la evidencia cruda. Si solo aparece el nombre de un PDF/archivo, no inventes su contenido: marcalo como adjunto visible pendiente de lectura. No concluyas que no existe material; indica que falta leer el contenido del adjunto.",
+        "Si aparece MATERIALES CLASSROOM RECIENTES en DATOS AUTORIZADOS, usalo como fuente preferida para preguntas posteriores como 'que debo estudiar para la prueba de Ciencias Naturales'. Cita la asignatura, el post/archivo y la fecha visible; si el material dice texto_no_detectado, no inventes contenido.",
+        "Si aparece MATERIAL DE ESTUDIO EXTRAIDO DE CLASSROOM en DATOS AUTORIZADOS, ese bloque tambien queda autorizado para responder preguntas posteriores sobre contenidos de pruebas, guias o archivos subidos por profesoras/profesores.",
         "",
         "IMPORTANTE SOBRE CLASSROOM: la evidencia de Classroom viene solo de Trabajo de clase, recorriendo Filtro por tema/asignatura. Cada snapshot de tema puede contener texto crudo visible y posts relevantes abiertos o capturados bajo titulos como prueba, evaluacion, tarea, control, test, guia, temario o material.",
         "Si existe un bloque DETALLE DE POSTS RELEVANTES ABIERTOS EN GOOGLE CLASSROOM o POSTS RELEVANTES VISIBLES EN GOOGLE CLASSROOM, dale prioridad sobre el texto crudo de la vista por tema. Ese bloque contiene items abiertos o ya desplegados en Trabajo de clase por tema/asignatura.",
         "Dentro de esos posts o vistas por tema, conserva el sentido del texto publicado: fecha de prueba/evaluacion/tarea, autor si aparece, temario, contenidos a estudiar, instrucciones y adjuntos/links relacionados.",
+        "",
+        f"IMPORTANTE SOBRE CALENDARIO SSCC: la evidencia de Calendario SSCC Segundo Ciclo - 4A viene del calendario oficial embebido del colegio. Usala como fuente adicional de fechas de tareas, pruebas, controles, salidas y actividades que mencionen 4A. La app ya filtra este calendario a la ventana {cutoff_date}..{calendar_window_end}; no reincorpores eventos anteriores ni posteriores a esa ventana aunque aparezcan en otros textos.",
+        "Si Classroom y Calendario SSCC mencionan el mismo evento, muestra el evento una sola vez y usa la fecha del calendario. Usa Classroom solo para complementar temario/material, no para duplicar eventos.",
+        "",
+        "IMPORTANTE SOBRE CALIFICACIONES: si aparece CALIFICACIONES P1/P2 CANONICAS SCHOOLNET, esa tabla es la unica fuente permitida para notas. No uses texto crudo, notas parciales, NF ni promedios inferidos para reemplazar ningun P1 o P2.",
+        "P1 corresponde al primer semestre y P2 al segundo semestre. La infografia actual debe usar P2 como columna principal de notas porque ya estamos en segundo semestre. Puede incluir P1 solo como referencia historica secundaria si hay espacio y no confunde. Si P2 viene vacio porque aun no hay notas del segundo semestre, deja la celda P2 en blanco en la infografia.",
         "",
         f"FECHA DE CORTE PARA TAREAS Y EVALUACIONES: {cutoff_date}.",
         "Incluye en TAREAS y EVALUACIONES solo actividades con fecha de hoy o futura. Excluye toda tarea, entrega, prueba, control o evaluacion con fecha anterior a la fecha de corte.",
@@ -6738,6 +9167,8 @@ def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str
         "",
         f"FECHA ACTUAL DEL REPORTE: {report_date}. Todos los entregables deben indicar esta fecha.",
         "",
+        authorized_data,
+        "",
         "SALIDA UNICA OBLIGATORIA",
         "Responde exclusivamente con UNA SOLA IMAGEN de infografia visual. No agregues texto antes de la imagen, no agregues texto despues de la imagen, no hagas preguntas y no entregues resumen en texto.",
         "Si tienes capacidad de generar imagenes, crea la imagen directamente como unica respuesta. Si no puedes crear imagenes en este chat, entrega solamente un prompt de imagen listo para copiar, sin explicaciones adicionales.",
@@ -6746,30 +9177,20 @@ def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str
         "ESTILO VISUAL OBLIGATORIO",
         "La infografia debe parecerse al ejemplo de referencia: reporte escolar vertical, colorido, amigable, con encabezado grande, tarjetas y secciones visuales claras.",
         "Formato vertical 2:3 o 1024x1536. Fondo claro. Bordes redondeados suaves. Estilo escolar limpio y alegre.",
-        "Usa azul para encabezado/calificaciones, verde para conducta, morado para tareas/evaluaciones, turquesa para material de estudio, naranjo para destacados y conclusion.",
+        "Usa azul para encabezado/calificaciones, verde para conducta, morado para tareas/evaluaciones, turquesa para material de estudio y naranjo solo para pendientes/dudas si existen.",
         "Usa iconos escolares simples: mochila, libros, calendario, trofeo, caritas de conducta, estrella, clipboard, medalla, cuaderno, lapiz.",
         "Texto grande y muy legible. Evita parrafos largos. No superpongas texto. No cortes palabras importantes.",
         "",
-        "Contenido obligatorio de la infografia:",
-        "- Titulo grande: REPORTE ACADEMICO Y DE CONDUCTA.",
-        f"- Estudiante: {STUDENT_NAME}.",
-        f"- Fecha del reporte: {report_date}.",
-        "- Curso: 4 BASICO.",
-        "- Semestre: Primer Semestre.",
-        "- Seccion CALIFICACIONES P1 con tabla Asignatura / Nota usando las notas P1 extraidas. Incluye asignaturas sin nota solo si hay espacio; prioriza asignaturas con nota.",
-        "- Promedio P1 si aparece.",
-        "- Seccion CONDUCTA con anotaciones positivas, negativas y neutras si se detectan. Si neutras no aparece, usar 0 solo si la evidencia permite inferirlo; si no, omitir neutras.",
-        "- Para CONDUCTA, revisa especialmente los bloques VISTA SCHOOLNET CONDUCTA: Anotaciones Positivas, Anotaciones Negativas y Anotaciones Neutras. No asumas 0 negativas solo porque la vista positiva no las muestra.",
-        "- Para describir una anotacion positiva o negativa, usa siempre el campo Observaciones como mensaje principal. No uses Motivo como descripcion visible, salvo que Observaciones este vacio o no detectado.",
-        "- En conducta, Motivo es una clasificacion tecnica/reglamentaria; Observaciones es el texto humano que debe aparecer en la infografia.",
-        "- Ultima anotacion con fecha, asignatura, profesor/categoria y mensaje si aparecen; el mensaje debe venir de Observaciones.",
-        "- Seccion SIGUIENTES TAREAS Y EVALUACIONES con actividades de hoy o futuras detectadas en Classroom. Indica fecha, asignatura, tipo y tema/texto breve.",
-        "- No dibujes ninguna tarea/evaluacion pasada en SIGUIENTES TAREAS Y EVALUACIONES, ni siquiera con etiqueta PASADA o EXCLUIDA.",
-        "- Marca como PRIORIDAD las actividades con fecha mas proxima y las que tengan material de estudio relacionado.",
-        "- Seccion MATERIAL DE ESTUDIO CLAVE con guias, PDFs, hojas de ruta, temarios, recursos o lecturas visibles en Classroom, especialmente si se relacionan con una evaluacion o tarea futura.",
-        "- Si Classroom incluye un post relevante con temario o instrucciones para una prueba futura, incluir ese temario como material de estudio clave y relacionarlo con la evaluacion correspondiente.",
-        "- Seccion DESTACADOS Y FORTALEZAS basada solo en evidencia: conducta positiva predominante, trabajo cooperativo, participacion, responsabilidad o buen rendimiento cuando aparezcan.",
-        "- Conclusion general breve y motivadora, sin exagerar.",
+        "SECCIONES PERMITIDAS Y OBLIGATORIAS DE LA INFOGRAFIA",
+        "- Encabezado: REPORTE ESCOLAR DE GABITO, fecha visible, Gabito, 4 BASICO A, Segundo Semestre.",
+        "- CALIFICACIONES P2 (SCHOOLNET): tabla con todas las asignaturas de CALIFICACIONES P1/P2 CANONICAS SCHOOLNET, usando P2 como nota principal del segundo semestre. Puedes mostrar P1 como referencia secundaria solo si hay espacio y queda claro que no es la nota actual. Mantener los blancos; no inferir.",
+        "- CONDUCTA (SCHOOLNET): mostrar siempre totales de positivas, negativas y neutras, y mostrar siempre la ultima anotacion con tipo, fecha, asignatura, profesor/categoria y mensaje de Observaciones.",
+        "- PROXIMAS TAREAS Y EVALUACIONES: una sola seccion, ordenada por fecha ascendente, usando Calendario SSCC como fuente principal y Classroom solo para tareas/pruebas futuras no duplicadas o detalles de material.",
+        "- MATERIAL DE ESTUDIO CLAVE: solo si esta relacionado con una tarea/evaluacion futura autorizada o si aparece explicitamente como material vigente.",
+        "- MATERIALES CLASSROOM RECIENTES: si existe, incluir una mini seccion de fuentes de estudio reales con post/archivo y texto extraido breve.",
+        "- MATERIAL EXTRAIDO DE ARCHIVOS CLASSROOM: si hay bloques con contenido leido desde adjuntos, resumirlos sin inventar y mencionar el post/archivo relacionado.",
+        "- PENDIENTES / DUDAS: solo si falta un dato necesario o hay contradiccion. No usar para rellenar.",
+        "No crear otras secciones. No crear Agenda semanal, Proximos eventos separados, Fortalezas, Para seguir creciendo, Notas importantes, Mensaje para Gabito, Asistencia, Comportamiento ni Responsabilidad.",
         "",
         "REGLAS DE EXTRACCION",
         "- Separa tareas de evaluaciones. Tareas son entregas o trabajos; evaluaciones son pruebas, controles o evaluaciones.",
@@ -6777,14 +9198,16 @@ def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str
         "- Si una prueba/control/evaluacion/tarea tiene fecha anterior a la fecha de corte, debe quedar totalmente fuera de la imagen final. No la listes, no la marques como vencida y no la uses como prioridad.",
         f"- Si la fecha no trae ano, usa {cutoff_year} para comparar contra la fecha de corte, pero conserva el texto original de la fecha en la respuesta.",
         "- Si una tarea/evaluacion no tiene fecha clara, no la listes como tarea o evaluacion activa; ponla en PENDIENTES / DUDAS como actividad sin fecha clara.",
-        "- En calificaciones, usa como fuente principal CALIFICACIONES P1 CANONICAS SCHOOLNET si aparece.",
-        "- En calificaciones, muestra siempre el promedio por asignatura de la columna P1; nunca uses las columnas 1, 2 o 3 como nota final de asignatura.",
-        "- En calificaciones, incluye todas las asignaturas visibles y deja en blanco las que no tengan P1.",
-        "- Para responder preguntas posteriores como 'de donde viene el 6,7 de Musica', busca primero en DETALLE POR ASIGNATURA SCHOOLNET CALIFICACIONES bajo ASIGNATURA: Musica. Si aparece una fila interna con nombre de evaluacion o actividad y esa nota, esa es la fuente de la nota.",
-        "- Para explicar de donde sale una nota de una asignatura, usa el bloque DETALLE CRUDO ESTRUCTURADO SCHOOLNET CALIFICACIONES. Las filas Tipo=Item bajo la misma Asignatura padre son evaluaciones o componentes de esa asignatura.",
-        "- Ejemplo: si Lenguaje tiene P1 6,8 y debajo aparece Item | Lenguaje y Comunicacion | Unidad 1 - Infografia | | 6,8 | ... entonces el 6,8 corresponde a la evaluacion Unidad 1 - Infografia.",
+        "- En calificaciones, usa como fuente unica CALIFICACIONES P1/P2 CANONICAS SCHOOLNET si aparece.",
+        "- En calificaciones, copia exactamente las filas Asignatura | P1 | P2 de esa tabla. Para la nota actual de la infografia usa P2. Nunca uses las columnas 1, 2, 3 o NF como nota final de asignatura.",
+        "- En calificaciones, si una asignatura tiene P2 vacio, deja esa celda P2 en blanco. No la reemplaces con P1, no la omitas y no infieras el valor desde otra columna.",
+        "- En calificaciones, no agregues asignaturas que no esten en la tabla canonica P1/P2.",
         "- Mantener formato chileno con coma decimal cuando aparezca asi en calificaciones.",
         "- Considerar solo Classroom 4A Trabajo de clase, organizado por Filtro por tema/asignatura.",
+        f"- Considerar Calendario SSCC Segundo Ciclo - 4A como fuente oficial adicional de fechas. Usa solo eventos 4A dentro de la ventana {cutoff_date}..{calendar_window_end}; excluye eventos pasados y eventos a mas de 1 mes.",
+        "- Si un evento del Calendario SSCC contiene palabras como prueba, control, evaluacion, tarea, entrega, salida, acto o actividad, incorporalo en SIGUIENTES TAREAS Y EVALUACIONES si no esta pasado.",
+        "- En proximas tareas/evaluaciones, no muestres ninguna fecha de mayo 2026 ni de meses anteriores cuando la fecha de corte sea junio 2026 o posterior.",
+        "- Si la evidencia cruda contiene tareas o pruebas antiguas, ignorarlas por completo. No las uses como agenda, no las marques como entregadas y no las incluyas en notas importantes.",
         "- Cuando exista DETALLE DE POSTS RELEVANTES ABIERTOS EN GOOGLE CLASSROOM o POSTS RELEVANTES VISIBLES EN GOOGLE CLASSROOM, usar esos textos como evidencia principal de Classroom. Ahi puede estar el temario completo de una prueba o evaluacion.",
         "- No confies en la seccion tareas pendientes como fuente unica: aunque diga que no hay pendientes, revisa las vistas por tema/asignatura de Trabajo de clase.",
         "- Extrae MATERIAL DE ESTUDIO DETECTADO desde Classroom aunque no sea tarea/evaluacion: guias, material de estudio, hojas de ruta, PDFs/archivos mencionados, temarios, recursos, lecturas, videos y adjuntos visibles.",
@@ -6795,7 +9218,7 @@ def build_master_chatgpt_prompt(snapshots: list[PageSnapshot], manual_notes: str
         "- Si la evidencia incluye DETALLE CANONICO SCHOOLNET CONDUCTA, usalo antes que DETALLE CRUDO ESTRUCTURADO SCHOOLNET CONDUCTA para redactar mensajes de conducta.",
         "- Si la evidencia incluye DETALLE CRUDO ESTRUCTURADO SCHOOLNET CONDUCTA, interpreta sus columnas asi: Fecha | Motivo | Profesor | Asignatura | Observaciones | Categoria. Para descripcion, mensaje o detalle visible de la anotacion, usa Observaciones; Motivo solo como tipo/clasificacion tecnica.",
         "- Conserva mentalmente la evidencia cruda de SchoolNet - Conducta para responder preguntas posteriores sobre una anotacion, fecha, asignatura o detalle especifico.",
-        "- No inventar fechas, asignaturas, calificaciones, temarios ni textos originales.",
+        "- No inventar fechas, asignaturas, calificaciones, temarios, textos originales, logos, curso, asistencia, comportamiento, responsabilidad, recomendaciones, habitos ni mensajes.",
         "- Si una seccion no tiene datos, escribir No detectado.",
         "",
         "EVIDENCIA CRUDA",
@@ -6853,6 +9276,10 @@ def format_raw_evidence_block(snapshot: PageSnapshot) -> str:
                     f"detalles_incompletos={stats.get('classroom_detail_incomplete_details', 0)}",
                     f"saltados_antiguos={stats.get('classroom_detail_posts_skipped_old', 0)}",
                     f"saltados_pasados={stats.get('classroom_detail_posts_skipped_past', 0)}",
+                    f"adjuntos_vistos={stats.get('classroom_attachments_seen', 0)}",
+                    f"adjuntos_intentados={stats.get('classroom_attachment_attempts', 0)}",
+                    f"adjuntos_con_texto={stats.get('classroom_attachment_texts', 0)}",
+                    f"posts_con_adjuntos_abiertos={stats.get('classroom_attachment_posts_opened', 0)}",
                 ]
             )
         titles = stats.get("classroom_detail_candidate_titles", [])
@@ -6875,6 +9302,34 @@ def format_raw_evidence_block(snapshot: PageSnapshot) -> str:
             )
         if conducta_diag:
             metadata.append("Diagnostico Conducta: " + " | ".join(conducta_diag))
+    if snapshot.platform.startswith("Calendario SSCC"):
+        calendar_diag: list[str] = []
+        if stats.get("calendar_source"):
+            calendar_diag.append(f"fuente={stats.get('calendar_source')}")
+        if stats.get("calendar_window_start") and stats.get("calendar_window_end"):
+            calendar_diag.append(
+                f"ventana={stats.get('calendar_window_start')}..{stats.get('calendar_window_end')}"
+            )
+        if stats.get("calendar_events_total") is not None:
+            calendar_diag.append(f"eventos_totales={stats.get('calendar_events_total', 0)}")
+        if stats.get("calendar_events_4a_raw") is not None:
+            calendar_diag.append(f"eventos_4a_crudos={stats.get('calendar_events_4a_raw', 0)}")
+        if stats.get("calendar_events_4a") is not None:
+            calendar_diag.append(f"eventos_4a={stats.get('calendar_events_4a', 0)}")
+        if stats.get("calendar_filtered_past"):
+            calendar_diag.append(f"filtrados_pasados={stats.get('calendar_filtered_past', 0)}")
+        if stats.get("calendar_filtered_future"):
+            calendar_diag.append(f"filtrados_fuera_de_1_mes={stats.get('calendar_filtered_future', 0)}")
+        if stats.get("calendar_filtered_unknown_date"):
+            calendar_diag.append(f"filtrados_sin_fecha={stats.get('calendar_filtered_unknown_date', 0)}")
+        if stats.get("calendar_filtered_not_4a"):
+            calendar_diag.append(f"filtrados_no_4a={stats.get('calendar_filtered_not_4a', 0)}")
+        if stats.get("calendar_filtered_outside_window"):
+            calendar_diag.append(f"filtrados_fuera_ventana={stats.get('calendar_filtered_outside_window', 0)}")
+        if stats.get("agenda_urls_checked") is not None:
+            calendar_diag.append(f"agendas_revisadas={stats.get('agenda_urls_checked', 0)}")
+        if calendar_diag:
+            metadata.append("Diagnostico Calendario SSCC: " + " | ".join(calendar_diag))
     metadata.extend(
         [
             "",
@@ -6887,7 +9342,7 @@ def format_raw_evidence_block(snapshot: PageSnapshot) -> str:
 
 
 def build_summary(snapshots: list[PageSnapshot], manual_notes: str = "") -> str:
-    today = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    today = current_report_datetime().strftime("%Y-%m-%d %H:%M")
     sections: dict[str, list[str]] = {name: [] for name in KEYWORDS}
     platform_blocks: list[str] = []
     alerts: list[str] = []
@@ -6997,8 +9452,195 @@ def dedupe(items: list[str]) -> list[str]:
     return output
 
 
+def report_outbox_dir(report_date: dt.date | None = None) -> Path:
+    value = report_date or current_report_date()
+    return OUTBOX_DIR / value.isoformat()
+
+
+def classroom_materials_dir(report_date: dt.date | None = None) -> Path:
+    return report_outbox_dir(report_date) / "materials"
+
+
+def safe_material_filename(label: str, href: str, index: int, content_type: str = "") -> str:
+    parsed = urlparse(str(href or ""))
+    path_name = unquote(Path(parsed.path).name or "")
+    raw = clean_text(path_name or label or "material-classroom")
+    raw = re.sub(r"[<>:\"/\\|?*\x00-\x1f]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip().strip(".")
+    if not raw:
+        raw = "material-classroom"
+    suffix = Path(raw).suffix.lower()
+    if not suffix and content_type:
+        guessed = mimetypes.guess_extension(content_type.split(";", 1)[0].strip().lower())
+        if guessed:
+            suffix = guessed
+    if not suffix:
+        suffix = ".bin"
+    stem = Path(raw).stem or "material-classroom"
+    stem = re.sub(r"[^A-Za-z0-9._ -]+", "", stem).strip(" ._-") or "material-classroom"
+    stem = stem[:70]
+    digest = hashlib.sha1(f"{label}|{href}".encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return f"{index:02d}-{stem}-{digest}{suffix}"
+
+
+def split_classroom_material_context(context_label: str, context_text: str = "") -> tuple[str, str]:
+    parts = [part.strip() for part in clean_text(context_label).split("|") if part.strip()]
+    subject = parts[0] if parts else ""
+    title = parts[1] if len(parts) > 1 else ""
+    if not subject:
+        subject = extract_subject(context_text)
+    if not title:
+        for line in clean_text(context_text).splitlines():
+            if line.lower().startswith("titulo:"):
+                title = line.split(":", 1)[1].strip()
+                break
+    return subject or "No detectada", title or "No detectado"
+
+
+def classroom_material_selection_reason(
+    label: str,
+    href: str,
+    context_label: str,
+    context_text: str,
+    today: dt.date,
+) -> str:
+    haystack = "\n".join([label, href, context_label, context_text])
+    normalized_text = normalize(haystack)
+    priority_markers = [
+        "sistema locomotor",
+        "ciencias naturales",
+        "cnat",
+        "prueba",
+        "evaluacion",
+        "control",
+        "test",
+        "temario",
+        "guia de estudio",
+        "hoja de ruta",
+    ]
+    mentions = extract_date_mentions(haystack, today)
+    concrete_dates = [
+        mention["date"]
+        for mention in mentions
+        if mention.get("kind") == "concrete" and isinstance(mention.get("date"), dt.date)
+    ]
+    if any(date >= today for date in concrete_dates) and any(marker in normalized_text for marker in priority_markers):
+        return "evento_o_evaluacion_futura"
+    if any(today - dt.timedelta(days=CLASSROOM_MATERIAL_WINDOW_DAYS) <= date <= today for date in concrete_dates):
+        return f"publicado_o_fechado_ultimos_{CLASSROOM_MATERIAL_WINDOW_DAYS}_dias"
+    if any(marker in normalized_text for marker in ("sistema locomotor", "ciencias naturales", "cnat")):
+        return "relacionado_con_evento_futuro_detectado"
+    return ""
+
+
+def classroom_material_record_summary(record: dict[str, Any], include_text: bool = True) -> list[str]:
+    lines = [
+        (
+            f"Material {record.get('number', '?')} | "
+            f"Asignatura: {record.get('subject', 'No detectada')} | "
+            f"Post: {record.get('post_title', 'No detectado')} | "
+            f"Archivo: {record.get('file_name', 'No detectado')} | "
+            f"Tipo: {record.get('kind', 'link')} | "
+            f"Motivo seleccion: {record.get('selection_reason', 'No detectado')}"
+        ),
+        f"Fecha visible/post: {record.get('posted', 'No detectada')}",
+        f"Estado texto: {record.get('text_status', 'No detectado')}",
+    ]
+    if record.get("relative_path"):
+        lines.append(f"Copia local/publicable: {record.get('relative_path')}")
+    if record.get("latest_object"):
+        lines.append(f"Objeto OCI esperado: {record.get('latest_object')}")
+    if include_text:
+        extracted = clean_text(str(record.get("extracted_text") or ""))
+        if extracted:
+            lines.extend(["Texto extraido:", extracted[:CLASSROOM_MATERIAL_TEXT_CHARS]])
+        else:
+            lines.append("Texto extraido: No detectado; usar solo como archivo visual si se publica el enlace.")
+    return lines
+
+
+def classroom_materials_summary_text(records: list[dict[str, Any]]) -> str:
+    lines = [
+        "MATERIALES CLASSROOM RECIENTES",
+        (
+            f"Criterio: adjuntos seleccionados desde Google Classroom 4-A en ventana de "
+            f"{CLASSROOM_MATERIAL_WINDOW_DAYS} dias o relacionados con proximas evaluaciones/eventos."
+        ),
+        "Regla para ChatGPT: usar el texto extraido como fuente; no inventar contenido si un archivo no tiene texto detectado.",
+    ]
+    if not records:
+        lines.append("No detectado")
+        return "\n".join(lines)
+    for record in records:
+        lines.append("")
+        lines.extend(classroom_material_record_summary(record, include_text=True))
+    return "\n".join(lines).strip()
+
+
+def classroom_visible_material_records_from_snapshots(
+    snapshots: list[PageSnapshot],
+    start_number: int = 1,
+    existing_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    today = current_report_date()
+    event_lines = authorized_event_lines(snapshots, today, add_calendar_months(today, SSCC_CALENDAR_LOOKAHEAD_MONTHS))
+    priority_terms = classroom_material_priority_terms(event_lines)
+    if not priority_terms:
+        return []
+    existing = existing_keys or set()
+    records: list[dict[str, Any]] = []
+    subject_counts: dict[str, int] = {}
+    blocks = authorized_classroom_material_blocks(
+        snapshots,
+        event_lines,
+        limit=CLASSROOM_MATERIAL_MAX_RECORDS,
+    )
+    for block in blocks:
+        normalized_block = normalize(block)
+        if not normalized_block or not any(term in normalized_block for term in priority_terms):
+            continue
+        if "no se pudo extraer texto visible del adjunto" in normalized_block:
+            continue
+        subject_match = re.search(r"Asignatura/tema detectado:\s*(.+)", block)
+        title_match = re.search(r"Titulo:\s*(.+)", block)
+        attachment_match = re.search(r"CONTENIDO EXTRAIDO DEL ADJUNTO CLASSROOM:\s*(.+)", block)
+        subject = single_line(subject_match.group(1)) if subject_match else extract_subject(block) or "No detectada"
+        post_title = single_line(title_match.group(1)) if title_match else "Material visible Classroom"
+        file_name = single_line(attachment_match.group(1)) if attachment_match else post_title
+        key = normalize(f"{subject}|{post_title}|{file_name}")
+        if not key or key in existing:
+            continue
+        subject_key = normalize(subject)
+        if subject_counts.get(subject_key, 0) >= CLASSROOM_MATERIAL_MAX_PER_SUBJECT:
+            continue
+        existing.add(key)
+        subject_counts[subject_key] = subject_counts.get(subject_key, 0) + 1
+        number = start_number + len(records)
+        text = clean_text(block)[:CLASSROOM_MATERIAL_TEXT_CHARS]
+        records.append(
+            {
+                "number": number,
+                "id": stable_id("material-visible", subject, post_title, file_name),
+                "subject": subject,
+                "post_title": post_title,
+                "posted": first_sortable_date(block) or "No detectada",
+                "file_name": file_name,
+                "kind": "classroom_visible",
+                "source_url": "",
+                "selection_reason": "material_visible_relacionado_con_evento_futuro",
+                "text_status": "texto_extraido" if text else "texto_no_detectado",
+                "extracted_text": text,
+                "error": "",
+                "download_status": "not_applicable_visible_material",
+            }
+        )
+        if start_number + len(records) > CLASSROOM_MATERIAL_MAX_RECORDS:
+            break
+    return records
+
+
 def save_summary(text: str) -> Path:
-    today = dt.date.today().isoformat()
+    today = current_report_date().isoformat()
     folder = OUTBOX_DIR / today
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "resumen.txt"
@@ -7007,12 +9649,61 @@ def save_summary(text: str) -> Path:
 
 
 def save_study_prompt(text: str) -> Path:
-    today = dt.date.today().isoformat()
+    today = current_report_date().isoformat()
     folder = OUTBOX_DIR / today
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "prompt_chatgpt.txt"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def generate_prompt_with_browser(
+    browser: BrowserController,
+    manual_notes: str = "",
+    force_full_scan: bool = False,
+) -> dict[str, Any]:
+    evidence_store = EvidenceStore()
+    snapshots = browser.targeted_snapshots(
+        force_full_scan=force_full_scan,
+        evidence_store=evidence_store,
+    )
+    cache_update_stats = evidence_store.update_from_snapshots(snapshots)
+    evidence_store.save()
+    cache_prompt_snapshots = evidence_store.to_page_snapshots()
+    prompt_snapshots = snapshots + cache_prompt_snapshots
+    if not prompt_snapshots:
+        prompt_snapshots = snapshots
+    prompt = build_master_chatgpt_prompt(prompt_snapshots, manual_notes=manual_notes)
+    prompt_path = save_study_prompt(prompt)
+    materials_dir = prompt_path.parent / "materials"
+    diagnostics_snapshots = snapshots + [evidence_store.summary_snapshot()]
+    return {
+        "prompt": prompt,
+        "prompt_path": prompt_path,
+        "materials_dir": materials_dir,
+        "materials_index_path": materials_dir / "materials_index.json",
+        "materials_summary_path": materials_dir / "materials_summary.txt",
+        "live_snapshots": snapshots,
+        "snapshots": diagnostics_snapshots,
+        "prompt_snapshots": prompt_snapshots,
+        "cache_update": cache_update_stats,
+    }
+
+
+def generate_prompt_once(
+    manual_notes: str = "",
+    force_full_scan: bool = False,
+    headless: bool | None = None,
+) -> dict[str, Any]:
+    browser = BrowserController(headless=headless)
+    try:
+        return generate_prompt_with_browser(
+            browser,
+            manual_notes=manual_notes,
+            force_full_scan=force_full_scan,
+        )
+    finally:
+        browser.close()
 
 
 def snapshot_payload(snapshot: PageSnapshot) -> dict[str, Any]:
@@ -7073,20 +9764,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 manual_notes = str(body.get("manual_notes", ""))
                 force_full_scan = bool(body.get("force_full_scan", False))
-                evidence_store = EvidenceStore()
-                snapshots = self.server.browser.targeted_snapshots(
+                result = generate_prompt_with_browser(
+                    self.server.browser,
+                    manual_notes=manual_notes,
                     force_full_scan=force_full_scan,
-                    evidence_store=evidence_store,
                 )
-                cache_update_stats = evidence_store.update_from_snapshots(snapshots)
-                evidence_store.save()
-                cache_prompt_snapshots = evidence_store.to_page_snapshots()
-                prompt_snapshots = snapshots + cache_prompt_snapshots
-                if not prompt_snapshots:
-                    prompt_snapshots = snapshots
-                prompt = build_master_chatgpt_prompt(prompt_snapshots, manual_notes=manual_notes)
-                prompt_path = save_study_prompt(prompt)
-                diagnostics_snapshots = snapshots + [evidence_store.summary_snapshot()]
+                prompt = str(result["prompt"])
+                prompt_path = result["prompt_path"]
                 self.server.last_summary = prompt
                 self.server.last_study_prompt = prompt
                 self.server.last_prompt = prompt
@@ -7101,9 +9785,9 @@ class Handler(BaseHTTPRequestHandler):
                         "summary": prompt,
                         "study_prompt": prompt,
                         "study_prompt_path": str(prompt_path),
-                        "snapshots": [snapshot_payload(snap) for snap in diagnostics_snapshots],
-                        "prompt_snapshots": [snapshot_payload(snap) for snap in prompt_snapshots],
-                        "cache_update": cache_update_stats,
+                        "snapshots": [snapshot_payload(snap) for snap in result["snapshots"]],
+                        "prompt_snapshots": [snapshot_payload(snap) for snap in result["prompt_snapshots"]],
+                        "cache_update": result["cache_update"],
                         "force_full_scan": force_full_scan,
                         "progress": self.server.browser.progress(),
                     }

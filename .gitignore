@@ -9,6 +9,8 @@ diagnostic_bundle_*/
 resumen_escolar_diagnostico_llm_*.zip
 *.zip
 *.log
+codex-*.json
+codex-*.pid
 logs/
 backups/
 *.bak

@@ -1,344 +1,390 @@
-# Resumen Escolar - contexto de diagnostico para LLM
+# Resumen Escolar
 
-Fecha de este README: 2026-05-11  
-Proyecto local: `C:\Users\Martin\Documents\Codex\resumen_escolar`  
-Archivo principal: `C:\Users\Martin\Documents\Codex\resumen_escolar\resumen_escolar\app.py`  
-Aplicacion local: `http://127.0.0.1:8765/`
+Aplicacion local en Python para recopilar evidencia escolar visible y generar un resumen diario de texto para correo, con calificaciones, conducta y agenda.
 
-## Objetivo de la app
+Este repositorio no debe contener sesiones de navegador, credenciales, prompts generados ni evidencia personal extraida. Esos datos viven en carpetas locales ignoradas por Git.
 
-Resumen Escolar es una app local en Python que usa Playwright con Chrome controlado para leer evidencia visible desde:
+## Como Opera
 
-- SchoolNet: calificaciones y conducta.
-- Google Classroom: curso 4-A, seccion Trabajo de clase.
+1. La app levanta un servidor local en `http://127.0.0.1:8765/`.
+2. Playwright abre un navegador persistente usando un perfil local en `.runtime/chrome-profile`.
+3. El usuario inicia sesion manualmente en las plataformas cuando sea necesario.
+4. La app extrae evidencia visible de:
+   - SchoolNet: calificaciones y conducta.
+   - Google Classroom: seccion Trabajo de clase del curso configurado.
+   - Calendario SSCC Segundo Ciclo: eventos del calendario oficial que mencionan `4A`.
+5. La evidencia se normaliza en snapshots internos.
+6. Un cache local incremental conserva registros historicos compactos en `.runtime/evidence_cache/evidence_store.json`.
+7. El generador arma `daily_report.txt` y `daily_report_state.json` en `outbox/YYYY-MM-DD/`.
+8. Si detecta adjuntos recientes o relacionados con evaluaciones futuras, genera un paquete desechable en `outbox/YYYY-MM-DD/materials/`.
+9. La automatizacion publica el reporte por OCI Notifications y conserva respaldos en Object Storage.
 
-Con esa evidencia genera un archivo `prompt_chatgpt.txt` para pedirle a ChatGPT una infografia escolar visual sobre el estudiante Gabito Garcia.
+## Flujo De Extraccion
 
-El prompt final debe pedir una unica salida principal:
+### SchoolNet - Calificaciones
 
-- una sola imagen/infografia visual;
-- sin texto copiable aparte;
-- sin pregunta final;
-- sin segunda parte fuera de la imagen.
+- Se leen calificaciones visibles.
+- La infografia debe usar la columna P1 como promedio del primer semestre por asignatura.
+- La infografia tambien debe incluir la columna P2 como promedio del segundo semestre por asignatura.
+- Si P2 no tiene datos porque el segundo semestre aun no inicia o no hay notas visibles, la celda P2 debe quedar en blanco.
+- El detalle interno de cada asignatura se conserva como evidencia para explicar de donde viene una nota.
+- Las notas parciales no deben reemplazar los promedios P1 o P2.
 
-## Estado actual del problema
+### SchoolNet - Conducta
 
-El prompt generado todavia no contiene la informacion completa de la prueba de Matematica del 26 de mayo.
+- La app intenta abrir las vistas de anotaciones positivas, negativas y neutras.
+- Se capturan tablas visibles con columnas como fecha, motivo, profesor, asignatura, observaciones y categoria.
+- Para describir una anotacion en la infografia, el prompt prioriza el campo Observaciones.
+- El campo Motivo se conserva como clasificacion tecnica o reglamentaria, no como texto principal de la anotacion.
 
-La evidencia que se espera extraer desde Classroom aparece en la vista de Google Classroom del curso 4-A, Trabajo de clase, tema/asignatura MATEMATICAS. El item relevante se ve como una tarjeta/material con titulo:
+### Google Classroom - Trabajo De Clase
 
-```text
-Prueba Unidad N°2 (26 DE MAYO)
-```
+- La app navega directo a la vista Trabajo de clase del curso configurado.
+- Se recorren temas/asignaturas validas mediante URLs de tema.
+- Se ignoran rutas globales como calendario, inicio, Gemini, tareas pendientes, ajustes o cursos archivados.
+- Se buscan tarjetas relevantes por palabras clave como prueba, evaluacion, control, test, examen, tarea, guia, temario, hoja de ruta o practice.
+- Para tarjetas relevantes, la app intenta abrir el detalle o convertir enlaces de material/asignacion a su vista `/details`.
+- Se extraen titulo, tema/asignatura, fechas visibles, texto crudo, links y adjuntos visibles.
+- Actividades con fecha anterior a la fecha de corte no deben mostrarse como tareas/evaluaciones proximas.
+- La lectura de Playwright es incremental y liviana: puede limitar la busqueda viva a posts recientes, pero el TXT generado debe incluir tambien el cache historico de Classroom con toda la informacion relevante ya levantada en corridas anteriores.
 
-Al abrir o desplegar ese item, Classroom muestra este texto relevante:
+### Calendario SSCC Segundo Ciclo
 
-```text
-MATEMÁTICAS
-Material
-book
-Prueba Unidad N°2 (26 DE MAYO)
-Publicado: Ayer
+- La app lee primero el feed iCal publico del calendario de evaluaciones 4A:
+  `c_aejfpaujkj4nm4u6kfbsc4eu2g@group.calendar.google.com`.
+- Extrae eventos estructurados que mencionen `4A`, `4 A`, `4-A`, `4°A` o variantes equivalentes.
+- Si el feed iCal falla, mantiene como respaldo la lectura visual del calendario embebido en `https://ssccmanquehue.cl/calendario-segundo-ciclo`.
+- Esos eventos se agregan al prompt como fuente oficial adicional de fechas de tareas, pruebas, controles, salidas y actividades.
+- La app filtra el calendario antes de armar el prompt: solo incluye eventos desde la fecha del reporte hasta un mes hacia adelante.
 
-Queridos niños y niñas,
-tal como lo agendamos, el próximo marte 26 de mayo tendremos una evaluación de la unidad 2. Para esta prueba el temario es el siguiente:
-- Resolver problemas mediante la adición o sustracción utilizando diversas estrategias ( descomposición, pictórico y algorítmo) hasta el 100.000.
-- Resolver operaciones mediante estrategias de cálculo mental.
-- Estimar sumas y restas redondeando números.
-- Identificar y resolver ecuaciones e inecuaciones.
-Para practicar recuerda revisar tus libros y cuaderno.
-Lección 5 a la 12 del libro y sus correspondiente prácticas del libro de práctica.
+## Prompt Para ChatGPT
 
-Cariños,
+El prompt maestro instruye a ChatGPT para:
 
-Miss Mariana
-```
+- usar solo la evidencia cruda incluida;
+- no inventar datos;
+- escribir `No detectado` si falta informacion;
+- producir una sola imagen/infografia visual;
+- no agregar texto antes ni despues de la imagen;
+- mantener fecha del reporte y fecha de corte;
+- excluir pruebas, controles, tareas o evaluaciones pasadas;
+- incluir material de estudio relacionado con evaluaciones futuras;
+- usar un titulo sugerido de chat con fecha, para que el historial de ChatGPT sea buscable.
 
-Ese bloque debe aparecer en la evidencia cruda del prompt porque es material clave para explicar de que se trata la prueba del 26 de mayo.
-
-## Resultado esperado en el prompt
-
-En `outbox/YYYY-MM-DD/prompt_chatgpt.txt`, dentro de la evidencia Classroom, deberia aparecer un bloque equivalente a:
-
-```text
-DETALLE DE POSTS RELEVANTES ABIERTOS EN GOOGLE CLASSROOM - 4-A - TRABAJO EN CLASE - TEMA: MATEMATICAS
-...
-Titulo: Prueba Unidad N°2 (26 DE MAYO)
-...
-Texto extraido al abrir el post:
-Queridos niños y niñas,
-...
-Resolver problemas mediante la adición o sustracción...
-Resolver operaciones mediante estrategias de cálculo mental.
-Estimar sumas y restas...
-Identificar y resolver ecuaciones e inecuaciones.
-Lección 5 a la 12...
-```
-
-Si ese texto no aparece, ChatGPT responde correctamente "No detectado" cuando se le pregunta por el temario, porque el problema esta en la extraccion de Classroom, no en ChatGPT.
-
-## Cambios realizados hasta ahora
-
-### Prompt maestro
-
-Se modifico el prompt maestro para que ChatGPT entregue una sola infografia visual:
-
-- Se elimino la logica de "Parte 2".
-- Se elimino "texto copiable y pegable".
-- Se elimino la pregunta final sobre si se desea texto copiable.
-- Se agrego la instruccion `SALIDA UNICA OBLIGATORIA`.
-- Se pidio explicitamente que la respuesta sea una sola imagen/infografia visual.
-- Se pidio no inventar datos y usar `No detectado` cuando falta evidencia.
-- Se mantuvo el estudiante Gabito Garcia.
-- Se mantuvo la fecha del reporte y fecha de corte.
-- Se prioriza la evidencia cruda entregada por la app.
-
-### SchoolNet
-
-La extraccion de SchoolNet funciona relativamente bien:
-
-- Calificaciones P1.
-- Conducta.
-- Detalle de anotaciones.
-- Lectura estructurada de tablas cuando es posible.
-
-### Classroom: intentos descartados
-
-Se evaluo usar Gemini en Classroom, pero se descarto:
-
-- No se encontro boton/caja de prompt de Gemini dentro de Classroom.
-- No se debe usar Gemini.
-- No se debe usar OAuth ni API de Google Classroom por ahora.
-- La solucion debe ser solamente Playwright leyendo el DOM/navegador.
-
-### Classroom: enfoque actual
-
-Se cambio el enfoque para evitar navegacion generica y lenta:
-
-- Curso fijo 4-A:
+El titulo sugerido tiene esta forma:
 
 ```text
-COURSE_ID = ODQ5Nzk2MDk0NDk5
-CLASSWORK_URL = https://classroom.google.com/w/ODQ5Nzk2MDk0NDk5/t/all
+Resumen Escolar - <estudiante> - YYYY-MM-DD
 ```
 
-- La app debe ir directo a `CLASSWORK_URL`.
-- No debe hacer clicks genericos en "Trabajo de clase", porque antes eso termino en:
+## Estructura Principal
 
 ```text
-https://classroom.google.com/a/not-turned-in/all
+resumen_escolar/
+  app.py          # servidor local, Playwright, extractores y prompt builder
+  __main__.py     # entrypoint python -m resumen_escolar
+  __init__.py
+
+requirements.txt # dependencia principal: playwright
+install_deps.cmd # instala dependencias en .runtime/site-packages
+run_resumen_escolar.cmd # levanta la app local
 ```
 
-- Solo se deben aceptar vistas reales de tema/asignatura con patron:
+## Carpetas Locales Sensibles
+
+Estas carpetas no deben subirse ni compartirse:
 
 ```text
-https://classroom.google.com/w/ODQ5Nzk2MDk0NDk5/tc/...
+.runtime/
+outbox/
+diagnostic_bundle_*/
+*.zip
 ```
 
-- Se deben rechazar explicitamente rutas globales:
+Detalles:
 
-```text
-/h
-/calendar
-/ai
-/s
-/a/not-turned-in
-otros cursos /c/...
-cursos archivados
-ajustes
-Gemini
-Inicio
-Calendar
-Tareas pendientes
-```
+- `.runtime/chrome-profile` contiene cookies, sesiones, caches del navegador y debe tratarse como credencial.
+- `.runtime/evidence_cache` contiene evidencia historica extraida y puede incluir datos personales.
+- `outbox/` contiene prompts generados y diagnosticos con evidencia escolar.
+- bundles diagnosticos y zips pueden contener copias de prompts o codigo en estados anteriores.
 
-### Classroom: extraccion esperada
+## Instalacion Local
 
-El extractor deberia:
+Requisitos:
 
-1. Abrir `https://classroom.google.com/w/ODQ5Nzk2MDk0NDk5/t/all`.
-2. Detectar links de temas/asignaturas `/tc/...`.
-3. Filtrar solo temas reales, por ejemplo:
-   - MATEMATICAS
-   - INGLES
-   - CIENCIAS SOCIALES
-   - CIENCIAS NATURALES
-   - Lenguaje
-   - Religion
-   - Musica
-   - Artes
-   - Tecnologia
-   - Educacion Fisica
-4. Abrir cada vista `/tc/...`.
-5. Buscar tarjetas o bloques cuyo titulo contenga palabras relevantes:
-   - prueba
-   - evaluacion
-   - test
-   - control
-   - examen
-   - tarea
-   - entrega
-   - temario
-   - guia
-   - hoja de ruta
-   - practice
-6. Para cada item relevante, intentar:
-   - abrir la URL de detalle si existe;
-   - convertir URLs `/m/{id}` a `/m/{id}/details`;
-   - si no existe URL, hacer click en el titulo/tarjeta;
-   - si el click falla, usar el texto visible desplegado como fallback.
-7. Guardar en evidencia:
-   - titulo exacto;
-   - seccion/fuente;
-   - asignatura/tema;
-   - fecha visible de publicacion;
-   - fechas detectadas;
-   - texto crudo;
-   - links/adjuntos visibles.
+- Windows con Python 3.11.
+- Chrome o Edge instalado en las rutas esperadas por `app.py`.
 
-## URL importante de ejemplo
-
-El usuario confirmo que el detalle del item de Matematica puede alcanzarse con una URL de este estilo:
-
-```text
-https://classroom.google.com/c/ODQ5Nzk2MDk0NDk5/m/ODYzMjYzMTUyNTYz/details
-```
-
-Esta URL es un ejemplo del patron a soportar. No se debe codificar duro ese item, pero el extractor debe poder derivar `/details` desde links `/m/...` cuando aparezcan en la tarjeta.
-
-## Logs problematicos anteriores
-
-### Caso lento y mal filtrado
-
-Playwright recorrio rutas globales como si fueran temas:
-
-```text
-Inicio -> https://classroom.google.com/h
-Calendar -> https://classroom.google.com/calendar/this-week/course/all
-Gemini -> https://classroom.google.com/ai
-Ajustes -> https://classroom.google.com/s
-Clases archivadas -> https://classroom.google.com/h/archived
-```
-
-Eso no debe ocurrir.
-
-### Caso redireccion a tareas pendientes
-
-En otro intento, el log mostro:
-
-```text
-Classroom: ubicar curso 4-A | url=https://classroom.google.com/
-Classroom: abrir Trabajo de clase | url=https://classroom.google.com/a/not-turned-in/all
-Classroom: leer Filtro por tema | temas=0
-```
-
-Eso tampoco debe ocurrir. Si aparece `/a/not-turned-in/all`, la app debe registrarlo como ruta global no permitida y no usar esa pagina como evidencia Classroom.
-
-## Diagnostico agregado en el codigo
-
-Se agregaron logs/estadisticas para Classroom:
-
-- cantidad de temas detectados;
-- URLs reales de tema;
-- candidatos de posts relevantes;
-- titulos candidatos;
-- URLs de detalle candidatas;
-- posts abiertos;
-- abiertos por URL;
-- abiertos por click;
-- clicks fallidos;
-- detalles vacios;
-- saltados por antiguedad;
-- saltados por fecha pasada.
-
-El README y el zip incluyen el codigo para que otro LLM revise si esos contadores estan bien alimentados y si la evidencia se incorpora al prompt final.
-
-## Archivos relevantes
-
-```text
-README.md
-requirements.txt
-install_deps.cmd
-run_resumen_escolar.cmd
-resumen_escolar/app.py
-resumen_escolar/__init__.py
-resumen_escolar/__main__.py
-outbox/2026-05-08/prompt_chatgpt.txt
-```
-
-No se incluye `.runtime/` porque contiene dependencias instaladas, perfil de Chrome y archivos grandes/no necesarios para diagnostico de codigo.
-
-## Como ejecutar
-
-Desde PowerShell:
+Instalar dependencias:
 
 ```powershell
-Set-Location "C:\Users\Martin\Documents\Codex\resumen_escolar"
-& ".\run_resumen_escolar.cmd"
+Set-Location "C:\ruta\al\proyecto"
+& ".\install_deps.cmd"
 ```
 
-La app abre:
+Levantar la app:
+
+```powershell
+Set-Location "C:\ruta\al\proyecto"; $env:TMP="C:\ruta\al\proyecto\.runtime\temp"; $env:TEMP=$env:TMP; New-Item -ItemType Directory -Force $env:TEMP | Out-Null; & ".\run_resumen_escolar.cmd"
+```
+
+Abrir:
 
 ```text
 http://127.0.0.1:8765/
 ```
 
-Flujo manual:
+## Configuracion A Revisar
 
-1. Abrir la app local.
-2. Presionar `Abrir plataformas`.
-3. Confirmar sesion en SchoolNet y Classroom.
-4. Presionar `Generar prompt ChatGPT`.
-5. Revisar `outbox/YYYY-MM-DD/prompt_chatgpt.txt`.
+El proyecto usa constantes en `app.py` para identificar el estudiante y el curso de Classroom. Antes de compartir o reutilizar el proyecto, reemplazar esos valores por placeholders o configuracion externa.
 
-## Comandos de validacion rapida
+Ejemplos de valores que no conviene publicar:
 
-Validar sintaxis sin generar `__pycache__`:
+- nombre real del estudiante;
+- ID real del curso de Classroom;
+- perfiles de navegador;
+- evidencia historica;
+- prompts generados;
+- credenciales o tokens.
 
-```powershell
-Set-Location "C:\Users\Martin\Documents\Codex\resumen_escolar"
-@'
-import ast
-from pathlib import Path
-path = Path("resumen_escolar/app.py")
-ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-print("syntax ok")
-'@ | python -B -
-```
+## Pruebas Recomendadas
 
-Buscar si el prompt generado contiene el temario esperado:
+Validar sintaxis:
 
 ```powershell
-Select-String -Path ".\outbox\2026-05-08\prompt_chatgpt.txt" -Pattern "Prueba Unidad|Resolver problemas|calculo mental|cálculo mental|sumas y restas|ecuaciones e inecuaciones|Leccion 5|Lección 5" -Context 2,4
+python -m compileall -q .
 ```
 
-## Preguntas concretas para el LLM que diagnostique
+Probar arranque local:
 
-1. Por que `prompt_chatgpt.txt` no incluye el texto completo del item `Prueba Unidad N°2 (26 DE MAYO)`?
-2. La funcion que descubre links `/tc/...` esta leyendo los elementos correctos de Classroom?
-3. La funcion que detecta candidatos relevantes esta encontrando la tarjeta de Matematica?
-4. La funcion que normaliza links `/m/...` a `/details` esta recibiendo el href correcto?
-5. El extractor de detalles se esta invocando en el flujo real de `_snapshot_classroom_page`?
-6. Hay algun filtro de fecha que pueda estar descartando erroneamente un post publicado "Ayer" pero con prueba futura el 26 de mayo?
-7. El texto extraido se esta truncando antes de llegar a la seccion de Matematica?
-8. La evidencia Classroom se esta incorporando al prompt final con prioridad suficiente?
-9. Hay selectores DOM demasiado generales o demasiado restrictivos para Classroom?
-10. Conviene leer directamente `document.body.innerText` de cada vista `/tc/...` antes de intentar abrir tarjetas, dado que algunas vistas ya muestran el cuerpo desplegado?
+```powershell
+Set-Location "C:\ruta\al\proyecto"; $env:TMP="C:\ruta\al\proyecto\.runtime\temp"; $env:TEMP=$env:TMP; New-Item -ItemType Directory -Force $env:TEMP | Out-Null; & ".\run_resumen_escolar.cmd"
+```
 
-## Criterios de exito
+Luego abrir `http://127.0.0.1:8765/`.
 
-El arreglo se considera correcto cuando:
+La prueba completa de Playwright debe hacerse con el usuario presente, porque puede requerir sesiones activas o login manual.
 
-- el log no muestra navegacion a `Gemini`, `Calendar`, `Inicio`, `Ajustes`, `Clases archivadas` ni `/a/not-turned-in/all`;
-- se detecta la vista de tema MATEMATICAS;
-- se detecta el titulo `Prueba Unidad N°2 (26 DE MAYO)`;
-- se abre o captura el detalle de esa tarjeta;
-- el prompt incluye:
-  - `Resolver problemas mediante la adición o sustracción`;
-  - `cálculo mental`;
-  - `sumas y restas`;
-  - `ecuaciones e inecuaciones`;
-  - `Lección 5 a la 12`;
-- ChatGPT puede responder de que se trata la prueba del 26 de mayo usando evidencia cruda;
-- el output pedido a ChatGPT sigue siendo solo una imagen/infografia visual.
+## Publicacion Y Seguridad
 
+Antes de commitear o compartir:
+
+```powershell
+git status --short --ignored
+git ls-files
+```
+
+Confirmar que no aparecen:
+
+- `.runtime/`
+- `outbox/`
+- `.env`
+- bases SQLite o DB locales;
+- logs;
+- zips diagnosticos;
+- llaves privadas;
+- tokens;
+- credenciales JSON.
+
+## Notas De Mantenimiento
+
+- `site-packages` dentro de `.runtime` es recreable con `install_deps.cmd`.
+- `chrome-profile` no debe borrarse salvo que se quiera forzar relogin completo.
+- `evidence_cache` mejora la eficiencia incremental, pero contiene datos extraidos.
+- Si Playwright falla por directorio temporal, crear `.runtime/temp` y asignar `TMP`/`TEMP` antes de ejecutar.
+
+## Automatizacion Diaria En OCI
+
+Objetivo: ejecutar el flujo en la VM `oracle-form-app-vm`, generar el reporte diario y publicarlo por OCI Notifications y Object Storage como:
+
+```text
+latest/daily_report.txt
+latest/daily_report_state.json
+archive/YYYY-MM-DD/daily_report.txt
+archive/YYYY-MM-DD/daily_report_state.json
+```
+
+El publicador usa OCI CLI. En la VM se recomienda `RESUMEN_ESCOLAR_OCI_AUTH=instance_principal`, con permisos IAM sobre el bucket privado. Asi no se guardan API keys, fingerprints ni archivos `.oci/config` dentro del repositorio.
+
+ Opcionalmente, el runner puede enviar una notificacion al publicar el TXT y tambien cuando falla antes de publicar. Para activarlo, crear un topic en OCI Notifications, suscribir un email y confirmar la suscripcion; luego definir `RESUMEN_ESCOLAR_NOTIFICATION_TOPIC_OCID` en `/opt/resumen-escolar/config/automation.env`.
+
+ El correo de exito contiene cambios semanticos y el estado completo. Al final incluye un bloque delimitado por RESUMEN_ESCOLAR_JSON_BEGIN y RESUMEN_ESCOLAR_JSON_END con JSON UTF-8 valido para que una conversacion de ChatGPT conectada a Outlook pueda localizar el correo mas reciente y responder preguntas sin cargas manuales. En `grades`, cada asignatura conserva sus promedios `p1` y `p2` e incluye `assessments` con cada fila evaluada visible al abrir esa asignatura en SchoolNet: fecha, titulo, todas las notas de la fila y otros datos de contexto. `grade_details` informa cuantas evaluaciones y asignaturas con evaluaciones se incluyeron. La fecha `report_date` identifica la corrida. El estado se compara contra la ultima ejecucion exitosa y el cuerpo completo se limita a 55 KB para respetar OCI Notifications.
+
+Las alertas de fallo estan activas por defecto cuando existe `RESUMEN_ESCOLAR_NOTIFICATION_TOPIC_OCID`. Si SchoolNet o Google Classroom quedan en login, el correo identifica la plataforma, incluye el comando PowerShell de recuperacion con el modo correcto (`SchoolNet`, `Classroom` o `Both`) y deja un log local de la sesion. Debe ejecutarse temporalmente sin la VPN corporativa, porque la VPN puede bloquear SSH hacia la VM. Para apagar alertas de fallo, definir `RESUMEN_ESCOLAR_NOTIFY_FAILURES=0`.
+
+### Configuracion Esperada En La VM
+
+Archivo privado sugerido:
+
+```text
+/opt/resumen-escolar/config/automation.env
+```
+
+Usar `.env.example` como plantilla. No commitear valores reales si contienen rutas locales sensibles, nombres privados de bucket o URLs PAR.
+
+Variables principales:
+
+```text
+RESUMEN_ESCOLAR_BUCKET=<bucket-privado>
+RESUMEN_ESCOLAR_OCI_REGION=ca-toronto-1
+RESUMEN_ESCOLAR_OCI_AUTH=instance_principal
+RESUMEN_ESCOLAR_HEADLESS=1
+RESUMEN_ESCOLAR_BROWSER_EXE=playwright
+RESUMEN_ESCOLAR_MATERIALS_LATEST_PREFIX=latest/materials
+RESUMEN_ESCOLAR_MATERIALS_ARCHIVE_TEMPLATE=archive/{date}/materials
+RESUMEN_ESCOLAR_SCHOOLNET_SECRET_OCID=<ocid-del-secret-vault>
+RESUMEN_ESCOLAR_NOTIFY_FAILURES=1
+```
+
+### Despliegue De Actualizaciones
+
+El despliegue normal usa `scripts/deploy_to_oracle_form_vm.ps1`. Verifica que la
+VM tenga `python3`, `venv`, `tar`, `curl` y `unzip`, pero no ejecuta `apt update`
+ni instala paquetes del sistema. Asi una actualizacion de Python no queda
+esperando repositorios de Ubuntu que no responden.
+
+En una VM nueva que realmente no tenga esos prerrequisitos, usar una sola vez
+el parametro `-BootstrapSystemPackages`. Ese modo habilita `apt` con un timeout
+de 30 segundos y un unico reintento, e instala las dependencias de sistema de
+Playwright; no se usa en despliegues rutinarios.
+
+### Materiales Recientes De Classroom
+
+El runner puede conservar materiales de Classroom como respaldo interno. No son
+necesarios para el correo diario y no se publican por defecto.
+
+Salida local:
+
+```text
+outbox/YYYY-MM-DD/materials/materials_summary.txt
+outbox/YYYY-MM-DD/materials/materials_index.json
+outbox/YYYY-MM-DD/materials/files/<archivo>
+```
+
+Los archivos originales son respaldo visual opcional. V1
+no hace OCR: si una imagen/PDF no entrega texto visible, queda marcado como
+`texto_no_detectado` y no se debe inventar contenido.
+
+La corrida puede abrir solo posts recientes para
+mantenerse liviana, pero el TXT conserva los posts relevantes ya levantados
+historicamente como memoria de respaldo; esos posts antiguos no deben tratarse
+como agenda vigente si sus fechas ya pasaron.
+
+### Credenciales SchoolNet En OCI Vault
+
+El login automatico de SchoolNet usa OCI Vault cuando esta configurado
+`RESUMEN_ESCOLAR_SCHOOLNET_SECRET_OCID`. El secreto debe contener JSON UTF-8:
+
+```json
+{
+  "username": "usuario-schoolnet",
+  "password": "clave-schoolnet"
+}
+```
+
+El runner lee el secreto con OCI CLI e `instance_principal`, deja usuario/clave solo
+en variables de entorno del proceso y no imprime esos valores. Classroom reutiliza
+la sesion Google del perfil Chromium; cuando expira, puede iniciar sesion por la
+interfaz web si `RESUMEN_ESCOLAR_GOOGLE_SECRET_OCID` apunta a otro secreto JSON
+con `username` y `password`. El secreto de Google se crea y configura directamente
+en OCI, sin copiar la clave al repositorio, al chat ni a los logs. Si Google exige
+MFA, CAPTCHA o bloquea el navegador automatizado, el cron se detiene, preserva el
+ultimo reporte valido y envia una alerta operacional.
+
+El cron usa la sesion persistente solo como optimizacion y no como fuente de
+contraseñas: antes de cada corrida ejecuta `scripts/ensure_chromium_cdp.sh`. Si
+Chromium ya expone CDP, reutiliza esa sesion; si no hay navegador, inicia uno
+headless con el mismo perfil y CDP local. Si el perfil esta ocupado sin CDP, se
+detiene sin matar procesos ni borrar locks, y la alerta se clasifica como problema
+de navegador, no como fallo de SchoolNet.
+
+Cuando SchoolNet muestra de verdad la pantalla de login, la app recupera el secreto
+desde Vault en memoria, realiza un solo intento automatico y verifica que salio del
+login. Las alertas distinguen: credencial/Vault no disponible, login rechazado,
+CDP/perfil ocupado y errores generales. Solo los dos primeros casos relacionados
+con SchoolNet deben pedir intervencion sobre la cuenta.
+
+Permiso IAM sugerido para la dynamic group de la VM:
+
+```text
+Allow dynamic-group resumen_escolar_gabitin_publishers to read secret-bundles in compartment <compartment>
+```
+
+Si tambien se usa la misma dynamic group para publicar el prompt, mantener la policy
+de Object Storage del bucket privado. Para restringir mas, usar OCIDs de compartment,
+vault o secret segun la politica IAM disponible en la tenancy.
+
+Fallback solo para pruebas locales:
+
+```text
+RESUMEN_ESCOLAR_SCHOOLNET_USERNAME=<usuario>
+RESUMEN_ESCOLAR_SCHOOLNET_PASSWORD=<clave>
+```
+
+No guardar esas dos variables con valores reales en Git, logs, paquetes de deploy ni
+archivos compartidos.
+
+Verificar desde la VM que el secreto se puede leer sin imprimir credenciales:
+
+```bash
+/opt/resumen-escolar/scripts/test_schoolnet_vault_secret.sh
+```
+
+### Runner No Interactivo
+
+Generar sin publicar:
+
+```bash
+python3 -m resumen_escolar.automation run
+```
+
+Generar y publicar el reporte diario y su estado:
+
+```bash
+python3 -m resumen_escolar.automation run --publish
+```
+
+El reporte se guarda como `outbox/YYYY-MM-DD/daily_report.txt` y el estado como
+`outbox/YYYY-MM-DD/daily_report_state.json`. La publicación diaria usa
+`latest/daily_report.txt`, `latest/daily_report_state.json` y sus copias bajo
+`archive/YYYY-MM-DD/`. El correo de OCI Notifications contiene únicamente
+texto plano listo para copiar y pegar; no incluye URLs PAR, rutas locales ni
+instrucciones para ChatGPT.
+
+Publicar un prompt legacy ya existente (compatibilidad):
+
+```bash
+python3 -m resumen_escolar.automation publish --prompt-path outbox/YYYY-MM-DD/prompt_chatgpt.txt
+```
+
+El runner no imprime el contenido del prompt. Solo reporta ruta, tamaño, estados de snapshots y resultado de subida. Por defecto falla antes de publicar si detecta estados bloqueados como login requerido o error de lectura.
+
+### Cron
+
+Script principal preparado:
+
+```text
+scripts/run_daily_report.sh
+```
+
+`scripts/run_weekly_prompt.sh` se conserva como wrapper compatible.
+
+El runner deja etapas `[1/8]` en `logs/daily-report-YYYY-MM-DD.log`, un latido
+cada minuto mientras la extraccion sigue activa y una advertencia visible al
+superar 25 minutos. El cierre siempre registra el `exit` real y los segundos
+transcurridos; una advertencia de 25 minutos no interrumpe por si sola el cron.
+
+Cron recomendado: todos los dias a las 03:00 hora local de Santiago.
+
+```cron
+CRON_TZ=America/Santiago
+0 3 * * * RESUMEN_ESCOLAR_APP_DIR=/opt/resumen-escolar /opt/resumen-escolar/scripts/run_daily_report.sh
+```
+
+La VM esta en UTC; si se quiere fijar estrictamente a GMT-4 sin depender de cambios de horario de Chile, el equivalente es `0 7 * * *` sin `CRON_TZ`.
+
+El script usa lock para evitar ejecuciones simultaneas y escribe logs en:
+
+```text
+/opt/resumen-escolar/logs/daily-report-YYYY-MM-DD.log
+```
